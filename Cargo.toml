@@ -1,11 +1,11 @@
 [package]
-name = "PyEntropyCalc"
+name = "py_entropy"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
 name = "py_entropy"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "lib"]
 
 [profile.release]
 lto = "fat"
