@@ -85,10 +85,9 @@ impl SingleDefectState {
         Ok(PyArray1::from_iter(py, self.state.iter().cloned()).to_owned())
     }
 
-
     /// Compute the purity of the state and return as a floating point value.
     pub fn get_purity(&self) -> f64 {
-        // F = sum_s p(s)^2 - sum_{s!=s'} p(s)p(s')
+        // F = D ( sum_s p(s)^2 - D sum_{s!=s'} p(s)p(s') )
         // p(s) = |<s|u|i>|^2
         // internal state is u|i>
 
@@ -122,7 +121,9 @@ impl SingleDefectState {
         &mut self,
         purity_iterator: It,
         periodic_boundaries: Option<bool>,
-    ) where It: IntoIterator<Item=&'a mut f64> {
+    ) where
+        It: IntoIterator<Item = &'a mut f64>,
+    {
         purity_iterator.into_iter().enumerate().for_each(|(i, f)| {
             self.apply_layer(i % 2 == 1, periodic_boundaries);
             *f = self.get_purity();
@@ -176,17 +177,19 @@ impl ThreadedSingleDefectStates {
         let state = state.as_slice()?.to_vec();
         Ok(Self {
             n: state.len(),
-            states: (0..num_samples).map(|_| SingleDefectState {
-                state: state.clone()
-            }).collect()
+            states: (0..num_samples)
+                .map(|_| SingleDefectState {
+                    state: state.clone(),
+                })
+                .collect(),
         })
     }
 
     /// Apply alternating layers of random unitaries.
     pub fn apply_alternative_layers(&mut self, n_layers: usize, periodic_boundaries: Option<bool>) {
-        self.states.par_iter_mut().for_each(|s| {
-            s.apply_alternative_layers(n_layers, periodic_boundaries)
-        })
+        self.states
+            .par_iter_mut()
+            .for_each(|s| s.apply_alternative_layers(n_layers, periodic_boundaries))
     }
 
     /// Compute the purity at each layer of the process and save to a numpy array.
@@ -213,9 +216,9 @@ impl ThreadedSingleDefectStates {
             .into_par_iter()
             .zip(self.states.par_iter())
             .for_each(|(mut row, state)| {
-                row.iter_mut().zip(state.get_state_raw().into_iter()).for_each(|(r,c)| {
-                    *r = c
-                })
+                row.iter_mut()
+                    .zip(state.get_state_raw().into_iter())
+                    .for_each(|(r, c)| *r = c)
             });
         Ok(res.into_pyarray(py).to_owned())
     }
@@ -225,9 +228,7 @@ impl ThreadedSingleDefectStates {
         let mut res = Array1::zeros((self.states.len(),));
         res.iter_mut()
             .zip(self.states.iter())
-            .for_each(|(f,state)| {
-                *f = state.get_purity()
-            });
+            .for_each(|(f, state)| *f = state.get_purity());
         Ok(res.into_pyarray(py).to_owned())
     }
 }
