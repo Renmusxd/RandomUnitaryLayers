@@ -110,8 +110,9 @@ impl SingleDefectState {
                 2.0 * p_s * sum_p_s_tilde
             })
             .sum::<f64>();
+        let d = self.state.len();
 
-        first_term - second_term
+        first_term - second_term/(d as f64)
     }
 }
 
