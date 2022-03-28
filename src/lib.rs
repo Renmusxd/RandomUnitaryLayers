@@ -1,11 +1,10 @@
 use num_complex::Complex;
-use numpy::ndarray::{Array1, Array3};
-use numpy::{c64, IntoPyArray, PyArray1, PyArray3, PyReadonlyArray1};
+use numpy::ndarray::{Array1, Array2, Array3, Axis};
+use numpy::{c64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1};
 use pyo3::prelude::*;
 use rand::prelude::*;
 use rayon::prelude::*;
 
-/// Unlike the Lattice class this maintains a set of graphs with internal state.
 #[pyclass]
 pub struct SingleDefectState {
     pub state: Vec<Complex<f64>>,
@@ -77,11 +76,7 @@ impl SingleDefectState {
         periodic_boundaries: Option<bool>,
     ) -> PyResult<Py<PyArray1<f64>>> {
         let mut res = Array1::zeros((n_layers,));
-        res.iter_mut().enumerate().for_each(|(i, f)| {
-            self.apply_layer(i % 2 == 1, periodic_boundaries);
-            *f = self.get_purity();
-        });
-
+        self.apply_alternative_layers_and_store_purity(res.iter_mut(), periodic_boundaries);
         Ok(res.into_pyarray(py).to_owned())
     }
 
@@ -90,10 +85,6 @@ impl SingleDefectState {
         Ok(PyArray1::from_iter(py, self.state.iter().cloned()).to_owned())
     }
 
-    /// Get the state of the system as a vector with real and imaginary values.
-    pub fn get_state_raw(&self) -> Vec<(f64, f64)> {
-        self.state.iter().map(|c| (c.re, c.im)).collect()
-    }
 
     /// Compute the purity of the state and return as a floating point value.
     pub fn get_purity(&self) -> f64 {
@@ -125,6 +116,25 @@ impl SingleDefectState {
     }
 }
 
+impl SingleDefectState {
+    /// Compute the purity at each layer of the process and save to a numpy array.
+    pub fn apply_alternative_layers_and_store_purity<'a, It>(
+        &mut self,
+        purity_iterator: It,
+        periodic_boundaries: Option<bool>,
+    ) where It: IntoIterator<Item=&'a mut f64> {
+        purity_iterator.into_iter().enumerate().for_each(|(i, f)| {
+            self.apply_layer(i % 2 == 1, periodic_boundaries);
+            *f = self.get_purity();
+        });
+    }
+
+    /// Get the state of the system as a vector with real and imaginary values.
+    pub fn get_state_raw(&self) -> Vec<Complex<f64>> {
+        self.state.clone()
+    }
+}
+
 // From secion 2.3 of http://home.lu.lv/~sd20008/papers/essays/Random%20unitary%20[paper].pdf
 fn make_unitary<R: Rng>(mut rng: R) -> [Complex<f64>; 4] {
     let two_pi = std::f64::consts::PI * 2.0;
@@ -153,8 +163,78 @@ fn apply_matrix(a: &mut Complex<f64>, b: &mut Complex<f64>, mat: &[Complex<f64>;
     *b = oa * mat[2] + ob * mat[3];
 }
 
+#[pyclass]
+pub struct ThreadedSingleDefectStates {
+    n: usize,
+    states: Vec<SingleDefectState>,
+}
+
+#[pymethods]
+impl ThreadedSingleDefectStates {
+    #[new]
+    pub fn new(num_samples: usize, state: PyReadonlyArray1<c64>) -> PyResult<Self> {
+        let state = state.as_slice()?.to_vec();
+        Ok(Self {
+            n: state.len(),
+            states: (0..num_samples).map(|_| SingleDefectState {
+                state: state.clone()
+            }).collect()
+        })
+    }
+
+    /// Apply alternating layers of random unitaries.
+    pub fn apply_alternative_layers(&mut self, n_layers: usize, periodic_boundaries: Option<bool>) {
+        self.states.par_iter_mut().for_each(|s| {
+            s.apply_alternative_layers(n_layers, periodic_boundaries)
+        })
+    }
+
+    /// Compute the purity at each layer of the process and save to a numpy array.
+    pub fn apply_alternative_layers_and_save_purity(
+        &mut self,
+        py: Python,
+        n_layers: usize,
+        periodic_boundaries: Option<bool>,
+    ) -> PyResult<Py<PyArray2<f64>>> {
+        let mut res = Array2::zeros((self.states.len(), n_layers));
+        res.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(self.states.par_iter_mut())
+            .for_each(|(mut row, state)| {
+                state.apply_alternative_layers_and_store_purity(row.iter_mut(), periodic_boundaries)
+            });
+        Ok(res.into_pyarray(py).to_owned())
+    }
+
+    /// Get the state of the system.
+    pub fn get_state(&self, py: Python) -> PyResult<Py<PyArray2<c64>>> {
+        let mut res = Array2::zeros((self.states.len(), self.n));
+        res.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(self.states.par_iter())
+            .for_each(|(mut row, state)| {
+                row.iter_mut().zip(state.get_state_raw().into_iter()).for_each(|(r,c)| {
+                    *r = c
+                })
+            });
+        Ok(res.into_pyarray(py).to_owned())
+    }
+
+    /// Compute the purity of the state and return as a floating point value.
+    pub fn get_purity(&self, py: Python) -> PyResult<Py<PyArray1<f64>>> {
+        let mut res = Array1::zeros((self.states.len(),));
+        res.iter_mut()
+            .zip(self.states.iter())
+            .for_each(|(f,state)| {
+                *f = state.get_purity()
+            });
+        Ok(res.into_pyarray(py).to_owned())
+    }
+}
+
 #[pymodule]
 fn py_entropy(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<SingleDefectState>()?;
+    m.add_class::<ThreadedSingleDefectStates>()?;
     Ok(())
 }
