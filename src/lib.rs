@@ -209,6 +209,26 @@ impl ThreadedSingleDefectStates {
         Ok(res.into_pyarray(py).to_owned())
     }
 
+    /// Compute the purity at each layer of the process and save to a numpy array.
+    pub fn apply_alternative_layers_and_save_mean_purity(
+        &mut self,
+        py: Python,
+        n_layers: usize,
+        periodic_boundaries: Option<bool>,
+    ) -> PyResult<Py<PyArray1<f64>>> {
+        let mut res = Array1::zeros((n_layers,));
+        res.iter_mut()
+            .enumerate()
+            .for_each(|(i, row)| {
+                let offset = i%2 == 1;
+                *row = self.states.par_iter_mut().map(|state| {
+                    state.apply_layer(offset, periodic_boundaries);
+                    state.get_purity()
+                }).sum::<f64>() / (self.states.len() as f64);
+            });
+        Ok(res.into_pyarray(py).to_owned())
+    }
+
     /// Get the state of the system.
     pub fn get_state(&self, py: Python) -> PyResult<Py<PyArray2<c64>>> {
         let mut res = Array2::zeros((self.states.len(), self.n));
