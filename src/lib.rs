@@ -90,29 +90,27 @@ impl SingleDefectState {
         // F = D ( sum_s p(s)^2 - D sum_{s!=s'} p(s)p(s') )
         // p(s) = |<s|u|i>|^2
         // internal state is u|i>
-
-        // First term is sum over |psi(i)|^4
-        let first_term = self
-            .state
-            .par_iter()
-            .map(|c| c.norm_sqr().powi(2))
-            .sum::<f64>();
-
-        // Second term is 2 sum_s p(s) ( sum_{s'>s} p(s') )
-        let second_term = (0..self.state.len())
-            .into_par_iter()
-            .map(|i| {
-                let p_s = self.state[i].norm_sqr();
-                let sum_p_s_tilde = self.state[i + 1..]
-                    .par_iter()
-                    .map(|c| c.norm_sqr())
-                    .sum::<f64>();
-                2.0 * p_s * sum_p_s_tilde
-            })
-            .sum::<f64>();
         let d = self.state.len();
 
-        first_term - second_term/(d as f64)
+        // First term is sum over |psi(i)|^4
+        let first_term = self.state.iter().map(|c| c.norm_sqr().powi(2)).sum::<f64>();
+
+        // Second term is 2 sum_s p(s) ( sum_{s'>s} p(s') )
+        // Can build the sum_{s'>s} backwards from the end to turn O(n^2) into O(n)
+        let (half_second_term, _) =
+            self.state
+                .iter()
+                .rev()
+                .cloned()
+                .fold((0.0, 0.0), |(acc, sum_ss), c| {
+                    // acc should be sum_{s>i} v[s] sum_{s'>s} v[s']
+                    // sum_ss should be sum_{s'>i} v[s']
+                    let c_ns = c.norm_sqr();
+                    (acc + c_ns * sum_ss, sum_ss + c_ns)
+                });
+        let second_term = 2.0 * half_second_term / (d as f64);
+
+        first_term - second_term
     }
 }
 
@@ -218,15 +216,18 @@ impl ThreadedSingleDefectStates {
         periodic_boundaries: Option<bool>,
     ) -> PyResult<Py<PyArray1<f64>>> {
         let mut res = Array1::zeros((n_layers,));
-        res.iter_mut()
-            .enumerate()
-            .for_each(|(i, row)| {
-                let offset = i%2 == 1;
-                *row = self.states.par_iter_mut().map(|state| {
+        res.iter_mut().enumerate().for_each(|(i, row)| {
+            let offset = i % 2 == 1;
+            *row = self
+                .states
+                .par_iter_mut()
+                .map(|state| {
                     state.apply_layer(offset, periodic_boundaries);
                     state.get_purity()
-                }).sum::<f64>() / (self.states.len() as f64);
-            });
+                })
+                .sum::<f64>()
+                / (self.states.len() as f64);
+        });
         Ok(res.into_pyarray(py).to_owned())
     }
 
