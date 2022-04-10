@@ -144,7 +144,6 @@ mod util_tests {
         enumerate_rec(&mut states, prefix, m - 1, 0, n);
 
         let mut index = 0;
-        let mut index = 0;
         for i in 0..n {
             for j in i + 1..n {
                 for k in j + 1..n {

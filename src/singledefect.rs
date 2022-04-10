@@ -121,7 +121,7 @@ impl SingleDefectState {
         })
     }
 
-    /// Compute the purity of the state and return as a floating point value.
+    /// Compute the purity estimator of the state and return as a floating point value.
     pub fn get_purity(&self) -> f64 {
         if let [(_, state)] = self.state.as_slice() {
             // F = D ( sum_s p(s)^2 - D sum_{s!=s'} p(s)p(s') )
