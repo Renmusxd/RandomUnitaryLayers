@@ -1,7 +1,7 @@
 use crate::utils::*;
 use num_complex::Complex;
-use numpy::ndarray::{Array1, Array2, Array3, Axis};
-use numpy::{c64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1};
+use numpy::ndarray::{s, Array1, Array3, Axis};
+use numpy::{c64, IntoPyArray, PyArray1, PyArray3, PyReadonlyArray1, ToPyArray};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -9,76 +9,109 @@ use rayon::prelude::*;
 #[pyclass]
 pub struct SingleDefectState {
     pub d: usize,
-    pub state: Vec<(f64, Vec<Complex<f64>>)>,
+    // Mixed states probs
+    pub probs: Array1<f64>,
+    // Experiments x Mixed states x Hilbert Space
+    pub states: Array3<Complex<f64>>,
 }
 
 #[pymethods]
 impl SingleDefectState {
     /// Construct a new instance.
     #[new]
-    fn new(state: PyReadonlyArray1<c64>) -> PyResult<Self> {
-        let state = vec![(1.0, state.as_slice()?.to_vec())];
-        let d = state[0].1.len();
-        Ok(Self { d, state })
+    fn new(state: PyReadonlyArray1<c64>, num_experiments: Option<usize>) -> PyResult<Self> {
+        Self::new_mixed(vec![(1.0, state)], num_experiments)
     }
 
     #[staticmethod]
-    fn new_mixed(state: Vec<(f64, PyReadonlyArray1<c64>)>) -> PyResult<Self> {
-        let (state, d) =
-            state
-                .into_iter()
-                .try_fold((vec![], None), |(mut acc, mut size), (w, s)| {
-                    let s = s.as_slice()?.to_vec();
-                    if let Some(d) = size {
-                        if s.len() != d {
-                            return Err(PyValueError::new_err("All states must be the same size"));
-                        }
-                    } else {
-                        size = Some(s.len());
-                    }
-                    acc.push((w, s));
-                    Ok((acc, size))
-                })?;
-        if let Some(d) = d {
-            Ok(Self { d, state })
-        } else {
-            Err(PyValueError::new_err(
+    fn new_mixed(
+        state: Vec<(f64, PyReadonlyArray1<c64>)>,
+        num_experiments: Option<usize>,
+    ) -> PyResult<Self> {
+        let num_experiments = num_experiments.unwrap_or(1);
+        if state.is_empty() {
+            return Err(PyValueError::new_err(
                 "Mixed state must contain at least one state",
-            ))
+            ));
         }
+        let probs = state.iter().map(|(w, _)| *w).collect();
+        let states = state
+            .iter()
+            .try_fold(vec![], |mut acc, (_, s)| -> Result<_, _> {
+                s.as_slice().map(|s| {
+                    acc.push(s);
+                    acc
+                })
+            })?;
+        let d = state[0].1.len();
+        let mut res_states = Array3::zeros((num_experiments, state.len(), d));
+        res_states
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .for_each(|mut x| {
+                // x is a Mixed x Hilbert matrix
+                x.axis_iter_mut(Axis(0))
+                    .into_par_iter()
+                    .zip(states.par_iter())
+                    .for_each(|(mut x, s)| {
+                        x.iter_mut().zip(s.iter()).for_each(|(x, s)| {
+                            *x = *s;
+                        });
+                    })
+            });
+        let states = res_states;
+        Ok(Self { d, probs, states })
     }
 
     pub fn apply_layer(&mut self, offset: bool, periodic_boundaries: Option<bool>) {
         let periodic_boundaries = periodic_boundaries.unwrap_or_default();
-        let mut rng = rand::thread_rng();
-
-        for (_, state) in &mut self.state {
-            let state_subsystem = if offset {
-                &mut state[1..]
-            } else {
-                state.as_mut()
-            };
-            // Seed randoms
-            state_subsystem.par_chunks_exact_mut(2).for_each(|c| {
-                let mut rng = rand::thread_rng();
-                if let [a, b] = c {
-                    let mat = make_unitary(&mut rng);
-                    apply_matrix(a, b, &mat);
+        self.states
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .for_each(|mut state| {
+                let num_states_mixed = state.shape()[0];
+                let mut state_subsystem = if offset {
+                    state.slice_mut(s![.., 1..])
                 } else {
-                    unreachable!()
+                    state.slice_mut(s![.., ..])
+                };
+                state_subsystem
+                    .axis_chunks_iter_mut(Axis(1), 2)
+                    .into_par_iter()
+                    .filter(|c| c.shape()[1] == 2)
+                    .for_each(|mut substate| {
+                        debug_assert_eq!(substate.shape(), [num_states_mixed, 2]);
+                        let mut rng = rand::thread_rng();
+                        let mat = make_unitary(&mut rng);
+                        substate
+                            .axis_iter_mut(Axis(0))
+                            .into_par_iter()
+                            .for_each(|mut ab| {
+                                debug_assert_eq!(ab.shape(), [2]);
+                                let mut oa = ab[0];
+                                let mut ob = ab[1];
+                                apply_matrix(&mut oa, &mut ob, &mat);
+                                ab[0] = oa;
+                                ab[1] = ob;
+                            });
+                    });
+
+                if periodic_boundaries && offset {
+                    let mut rng = rand::thread_rng();
+                    let mat = make_unitary(&mut rng);
+                    let n = state.shape()[1];
+                    state
+                        .axis_iter_mut(Axis(0))
+                        .into_par_iter()
+                        .for_each(|mut state| {
+                            let mut oa = state[n - 1];
+                            let mut ob = state[0];
+                            apply_matrix(&mut oa, &mut ob, &mat);
+                            state[n - 1] = oa;
+                            state[0] = ob;
+                        })
                 }
             });
-            // If periodic boundary conditions are on, and the offset is on, then do 0 and n-1
-            if periodic_boundaries && offset {
-                let mat = make_unitary(&mut rng);
-                let n = state.len();
-                let mut oa = state[n - 1];
-                let mut ob = state[0];
-                apply_matrix(&mut oa, &mut ob, &mat);
-                state[n - 1] = oa;
-                state[0] = ob;
-            }
-        }
     }
 
     pub fn make_unitaries(&self, py: Python, n: usize) -> PyResult<Py<PyArray3<c64>>> {
@@ -100,163 +133,28 @@ impl SingleDefectState {
         }
     }
 
-    /// Compute the purity at each layer of the process and save to a numpy array.
-    pub fn apply_alternative_layers_and_save_purity(
-        &mut self,
-        py: Python,
-        n_layers: usize,
-        periodic_boundaries: Option<bool>,
-    ) -> PyResult<Py<PyArray1<f64>>> {
-        let mut res = Array1::zeros((n_layers,));
-        self.apply_alternative_layers_and_store_purity(res.iter_mut(), periodic_boundaries);
-        Ok(res.into_pyarray(py).to_owned())
-    }
-
     /// Get the state of the system.
-    pub fn get_state(&self, py: Python) -> PyResult<Vec<(f64, Py<PyArray1<c64>>)>> {
-        self.state.iter().try_fold(vec![], |mut acc, (w, v)| {
-            let s = PyArray1::from_iter(py, v.iter().cloned()).to_owned();
-            acc.push((*w, s));
-            Ok(acc)
-        })
+    pub fn get_state(&self, py: Python) -> (Py<PyArray1<f64>>, Py<PyArray3<c64>>) {
+        let probs = self.probs.to_pyarray(py).to_owned();
+        let states = self.states.to_pyarray(py).to_owned();
+        (probs, states)
     }
 
-    /// Compute the purity estimator of the state and return as a floating point value.
-    pub fn get_purity(&self) -> f64 {
-        if let [(_, state)] = self.state.as_slice() {
-            // F = D ( sum_s p(s)^2 - D sum_{s!=s'} p(s)p(s') )
-            // p(s) = |<s|u|i>|^2
-            // internal state is u|i>
-
-            // First term is sum over |psi(i)|^4
-            let first_term = state.iter().map(|c| c.norm_sqr().powi(2)).sum::<f64>();
-
-            // Second term is 2 sum_s p(s) ( sum_{s'>s} p(s') )
-            // Can build the sum_{s'>s} backwards from the end to turn O(n^2) into O(n)
-            let f = |x: Complex<f64>| -> f64 { x.norm_sqr() };
-            let half_second_term = sum_s_sprime(state.iter().rev().cloned(), 0.0, 0.0, f, f);
-            let second_term = 2.0 * half_second_term / (self.d as f64);
-
-            first_term - second_term
-        } else {
-            // first_term = sum_s ( sum_alpha p_alpha |<s|U|alpha>|^2)^2
-            let first_term = (0..self.d)
-                .map(|s| {
-                    self.state
-                        .iter()
-                        .map(|(w, state)| *w * state[s].norm_sqr())
-                        .sum::<f64>()
-                        .powi(2)
-                })
-                .sum::<f64>();
-
-            let f = |s: usize| -> f64 {
-                self.state
-                    .iter()
-                    .map(|(w, state)| *w * state[s].norm_sqr())
-                    .sum::<f64>()
-            };
-            let half_second_term = sum_s_sprime((0..self.d).rev(), 0.0, 0.0, f, f);
-            let second_term = 2.0 * half_second_term / (self.d as f64);
-
-            first_term - second_term
-        }
-    }
-}
-
-impl SingleDefectState {
-    /// Compute the purity at each layer of the process and save to a numpy array.
-    pub fn apply_alternative_layers_and_store_purity<'a, It>(
-        &mut self,
-        purity_iterator: It,
-        periodic_boundaries: Option<bool>,
-    ) where
-        It: IntoIterator<Item = &'a mut f64>,
-    {
-        purity_iterator.into_iter().enumerate().for_each(|(i, f)| {
-            self.apply_layer(i % 2 == 1, periodic_boundaries);
-            *f = self.get_purity();
-        });
+    pub fn get_mean_purity(&self) -> f64 {
+        let purities = self.get_purity_iterator();
+        purities.sum::<f64>() / (self.states.shape()[0] as f64)
     }
 
-    /// Get the state of the system as a vector with real and imaginary values.
-    pub fn get_state_raw(&self) -> Vec<(f64, Vec<Complex<f64>>)> {
-        self.state.clone()
-    }
-}
-
-#[pyclass]
-pub struct ThreadedSingleDefectStates {
-    n: usize,
-    mixture_probs: Vec<f64>,
-    states: Vec<SingleDefectState>,
-}
-
-#[pymethods]
-impl ThreadedSingleDefectStates {
-    #[new]
-    pub fn new(num_samples: usize, state: PyReadonlyArray1<c64>) -> PyResult<Self> {
-        let state = state.as_slice()?.to_vec();
-        Ok(Self {
-            n: state.len(),
-            mixture_probs: vec![1.0],
-            states: (0..num_samples)
-                .map(|_| SingleDefectState {
-                    d: state.len(),
-                    state: vec![(1.0, state.clone())],
-                })
-                .collect(),
-        })
-    }
-
-    #[staticmethod]
-    fn new_mixed(num_samples: usize, state: Vec<(f64, PyReadonlyArray1<c64>)>) -> PyResult<Self> {
-        let mixture_probs = state.iter().map(|(w, _)| *w).collect();
-        let d = state[0].1.len();
-        Ok(Self {
-            n: d,
-            mixture_probs,
-            states: (0..num_samples).try_fold(vec![], |mut acc, _| -> Result<_, PyErr> {
-                let state = state
-                    .iter()
-                    .try_fold(
-                        vec![],
-                        |mut acc, (w, s)| -> Result<_, numpy::NotContiguousError> {
-                            let s = s.as_slice()?;
-                            acc.push((*w, s.to_vec()));
-                            Ok(acc)
-                        },
-                    )
-                    .map_err(|e| PyValueError::new_err(format!("Error making state: {:?}", e)))?;
-                let sds = SingleDefectState { d, state };
-                acc.push(sds);
-                Ok(acc)
-            })?,
-        })
-    }
-
-    /// Apply alternating layers of random unitaries.
-    pub fn apply_alternative_layers(&mut self, n_layers: usize, periodic_boundaries: Option<bool>) {
-        self.states
-            .par_iter_mut()
-            .for_each(|s| s.apply_alternative_layers(n_layers, periodic_boundaries))
-    }
-
-    /// Compute the purity at each layer of the process and save to a numpy array.
-    pub fn apply_alternative_layers_and_save_purity(
-        &mut self,
-        py: Python,
-        n_layers: usize,
-        periodic_boundaries: Option<bool>,
-    ) -> PyResult<Py<PyArray2<f64>>> {
-        let mut res = Array2::zeros((self.states.len(), n_layers));
-        res.axis_iter_mut(Axis(0))
-            .into_par_iter()
-            .zip(self.states.par_iter_mut())
-            .for_each(|(mut row, state)| {
-                state.apply_alternative_layers_and_store_purity(row.iter_mut(), periodic_boundaries)
+    pub fn get_all_purities(&self, py: Python) -> Py<PyArray1<f64>> {
+        let purity_iterator = self.get_purity_iterator();
+        let mut purities = Array1::<f64>::zeros((self.states.shape()[0],));
+        purity_iterator
+            .zip(purities.axis_iter_mut(Axis(0)).into_par_iter())
+            .for_each(|(pa, mut pb)| {
+                // Should just be 1.
+                pb.iter_mut().for_each(|pb| *pb = pa);
             });
-        Ok(res.into_pyarray(py).to_owned())
+        purities.into_pyarray(py).to_owned()
     }
 
     /// Compute the purity at each layer of the process and save to a numpy array.
@@ -267,48 +165,86 @@ impl ThreadedSingleDefectStates {
         periodic_boundaries: Option<bool>,
     ) -> PyResult<Py<PyArray1<f64>>> {
         let mut res = Array1::zeros((n_layers,));
-        res.iter_mut().enumerate().for_each(|(i, row)| {
-            let offset = i % 2 == 1;
-            *row = self
-                .states
-                .par_iter_mut()
-                .map(|state| {
-                    state.apply_layer(offset, periodic_boundaries);
-                    state.get_purity()
-                })
-                .sum::<f64>()
-                / (self.states.len() as f64);
-        });
+        self.apply_alternative_layers_and_store_mean_purity(res.iter_mut(), periodic_boundaries);
         Ok(res.into_pyarray(py).to_owned())
     }
+}
 
-    /// Get the state of the system.
-    pub fn get_state(&self, py: Python) -> PyResult<Vec<(f64, Py<PyArray2<c64>>)>> {
-        self.mixture_probs
-            .iter()
-            .cloned()
-            .enumerate()
-            .try_fold(vec![], |mut acc, (i, w)| {
-                let mut res = Array2::zeros((self.states.len(), self.n));
-                res.axis_iter_mut(Axis(0))
-                    .zip(self.states.iter())
-                    .for_each(|(mut row, state)| {
-                        row.iter_mut()
-                            .zip(state.state[i].1.iter().cloned())
-                            .for_each(|(r, c)| *r = c)
-                    });
-                let res = res.into_pyarray(py).to_owned();
-                acc.push((w, res));
-                Ok(acc)
+impl SingleDefectState {
+    /// Compute the purity estimator of the state and return as a floating point value.
+    pub fn get_purity_iterator(&self) -> impl IndexedParallelIterator<Item = f64> + '_ {
+        self.states
+            .axis_iter(Axis(0))
+            .into_par_iter()
+            .map(|state| -> f64 {
+                if state.shape()[0] == 1 {
+                    // Fast way
+                    let state = state.slice(s![0, ..]);
+                    // F = D ( sum_s p(s)^2 - D sum_{s!=s'} p(s)p(s') )
+                    // p(s) = |<s|u|i>|^2
+                    // internal state is u|i>
+
+                    // First term is sum over |psi(i)|^4
+                    let first_term = state.iter().map(|c| c.norm_sqr().powi(2)).sum::<f64>();
+
+                    // Second term is 2 sum_s p(s) ( sum_{s'>s} p(s') )
+                    // Can build the sum_{s'>s} backwards from the end to turn O(n^2) into O(n)
+                    let fs = state.iter().rev().map(Complex::norm_sqr);
+                    let half_second_term = sum_s_sprime_iterator(fs, 0.0, 0.0);
+                    let second_term = 2.0 * half_second_term / (self.d as f64);
+
+                    first_term - second_term
+                } else {
+                    // Slower way
+                    // first_term = sum_s ( sum_alpha p_alpha |<s|U|alpha>|^2)^2
+                    let first_term = state
+                        .axis_iter(Axis(1))
+                        .into_par_iter()
+                        .map(|s_for_each_mix| {
+                            s_for_each_mix
+                                .iter()
+                                .zip(self.probs.iter())
+                                .map(|(c, p_alpha)| p_alpha * c.norm_sqr())
+                                .sum::<f64>()
+                                .powi(2)
+                        })
+                        .sum::<f64>();
+
+                    let probs = &self.probs;
+                    let f = |s: usize| -> f64 {
+                        state
+                            .slice(s![.., s])
+                            .iter()
+                            .zip(probs.iter().cloned())
+                            .map(|(c, p_alpha)| p_alpha * c.norm_sqr())
+                            .sum::<f64>()
+                    };
+                    let half_second_term =
+                        sum_s_sprime_iterator((0..self.d).rev().map(f), 0.0, 0.0);
+
+                    let second_term = 2.0 * half_second_term / (self.d as f64);
+
+                    first_term - second_term
+                }
             })
     }
 
-    /// Compute the purity of the state and return as a floating point value.
-    pub fn get_purity(&self, py: Python) -> PyResult<Py<PyArray1<f64>>> {
-        let mut res = Array1::zeros((self.states.len(),));
-        res.iter_mut()
-            .zip(self.states.iter())
-            .for_each(|(f, state)| *f = state.get_purity());
-        Ok(res.into_pyarray(py).to_owned())
+    /// Compute the purity at each layer of the process and save to a numpy array.
+    pub fn apply_alternative_layers_and_store_mean_purity<'a, It>(
+        &mut self,
+        purity_iterator: It,
+        periodic_boundaries: Option<bool>,
+    ) where
+        It: IntoIterator<Item = &'a mut f64>,
+    {
+        purity_iterator.into_iter().enumerate().for_each(|(i, f)| {
+            self.apply_layer(i % 2 == 1, periodic_boundaries);
+            *f = self.get_mean_purity();
+        });
+    }
+
+    /// Get the state of the system as a vector with real and imaginary values.
+    pub fn get_state_raw(&self) -> Array3<Complex<f64>> {
+        self.states.clone()
     }
 }

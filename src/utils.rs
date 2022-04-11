@@ -6,7 +6,8 @@ use std::cmp::Ordering;
 use std::ops::{Add, Mul};
 
 /// Calculates SUM in O(N) from an iterator of [t_n,...,t_0]
-/// Where SUM = sum_base + f(t_n)*acc_base + sum_{i<j} f(t_i) g(t_j)
+/// Where SUM = sum_base + sum_i f(t_i)*acc_base + sum_{i<j} f(t_i) g(t_j)
+#[inline]
 pub fn sum_s_sprime<F, G, T, V, IT>(ts: IT, mut sum_base: V, mut acc_base: V, f: F, g: G) -> V
 where
     IT: IntoIterator<Item = T>,
@@ -20,6 +21,44 @@ where
         acc_base = acc_base + g(t);
     }
     sum_base
+}
+
+/// Calculates SUM in O(N) from a iterators of [f_n,...,f_0] and [g_n,...g_0]
+/// Where SUM = sum_base + sum_i f_i*acc_base + sum_{i<j} f_i g_j
+#[inline]
+pub fn sum_s_sprime_iterators<FS, GS, V>(f: FS, g: GS, sum_base: V, acc_base: V) -> V
+where
+    FS: IntoIterator<Item = V>,
+    GS: IntoIterator<Item = V>,
+    V: Add<Output = V> + Mul<Output = V> + Copy,
+{
+    let (sum, _) = f.into_iter().zip(g.into_iter()).fold(
+        (sum_base, acc_base),
+        |(mut sum, mut acc), (f_i, g_i)| {
+            sum = sum + f_i * acc;
+            acc = acc + g_i;
+            (sum, acc)
+        },
+    );
+    sum
+}
+
+/// Calculates SUM in O(N) from a iterator of [f_n,...,f_0]
+/// Where SUM = sum_base + sum_i f_i*acc_base + sum_{i<j} f_i f_j
+#[inline]
+pub fn sum_s_sprime_iterator<FS, V>(f: FS, sum_base: V, acc_base: V) -> V
+where
+    FS: IntoIterator<Item = V>,
+    V: Add<Output = V> + Mul<Output = V> + Copy,
+{
+    let (sum, _) = f
+        .into_iter()
+        .fold((sum_base, acc_base), |(mut sum, mut acc), f_i| {
+            sum = sum + f_i * acc;
+            acc = acc + f_i;
+            (sum, acc)
+        });
+    sum
 }
 
 // From secion 2.3 of http://home.lu.lv/~sd20008/papers/essays/Random%20unitary%20[paper].pdf

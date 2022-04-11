@@ -1,17 +1,171 @@
-use crate::utils::{apply_matrix, enumerate_rec, index_of_state, make_index_deltas, make_unitary};
+use crate::utils::{
+    apply_matrix, enumerate_rec, index_of_state, make_index_deltas, make_unitary,
+    sum_s_sprime_iterator,
+};
 use num_complex::Complex;
-use num_traits::Zero;
+use numpy::ndarray::{s, Array1, Array3, Axis};
+use numpy::{
+    c64, IntoPyArray, PyArray1, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+    ToPyArray,
+};
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 use rand::Rng;
 use rayon::prelude::*;
 use smallvec::{smallvec, SmallVec};
+use std::ops::IndexMut;
 
-struct MixedState {
-    state: Vec<(f64, Vec<Complex<f64>>)>,
+#[pyclass]
+pub struct MultiDefectState {
+    mds: MultiDefectStateRaw<8>,
+}
+
+impl MultiDefectState {
+    /// Compute the purity at each layer of the process and save to a numpy array.
+    pub fn apply_alternative_layers_and_store_mean_purity<'a, It>(&mut self, purity_iterator: It)
+    where
+        It: IntoIterator<Item = &'a mut f64>,
+    {
+        purity_iterator.into_iter().enumerate().for_each(|(i, f)| {
+            self.apply_layer(i % 2 == 1);
+            *f = self.get_mean_purity();
+        });
+    }
+}
+
+#[pymethods]
+impl MultiDefectState {
+    #[new]
+    fn new(
+        indices: Vec<Vec<usize>>,
+        amplitudes: PyReadonlyArray1<c64>,
+        n_sites: usize,
+        n_defects: usize,
+        num_experiments: Option<usize>,
+    ) -> PyResult<Self> {
+        let state = indices
+            .into_iter()
+            .zip(amplitudes.to_owned_array().into_iter())
+            .map(|(indx, c)| (indx, Complex::new(c.re, c.im)))
+            .collect();
+        let mds = MultiDefectStateRaw::<8>::new_pure(state, n_sites, n_defects, num_experiments)
+            .map_err(PyValueError::new_err)?;
+        Ok(Self { mds })
+    }
+
+    #[staticmethod]
+    fn new_pure(
+        indices: PyReadonlyArray2<usize>,
+        amplitudes: PyReadonlyArray1<c64>,
+        n_sites: usize,
+        n_defects: usize,
+        num_experiments: Option<usize>,
+    ) -> PyResult<Self> {
+        let state = indices
+            .to_owned_array()
+            .axis_iter(Axis(0))
+            .zip(amplitudes.to_owned_array().into_iter())
+            .map(|(indx, c)| {
+                (
+                    indx.into_iter().cloned().collect(),
+                    Complex::new(c.re, c.im),
+                )
+            })
+            .collect();
+        let mds = MultiDefectStateRaw::<8>::new_pure(state, n_sites, n_defects, num_experiments)
+            .map_err(PyValueError::new_err)?;
+        Ok(Self { mds })
+    }
+
+    #[staticmethod]
+    fn new_mixed(
+        indices: PyReadonlyArray3<usize>,
+        probs: PyReadonlyArray1<f64>,
+        amplitudes: PyReadonlyArray2<c64>,
+        n_sites: usize,
+        n_defects: usize,
+        num_experiments: Option<usize>,
+    ) -> PyResult<Self> {
+        let state = probs
+            .to_owned_array()
+            .iter()
+            .cloned()
+            .zip(amplitudes.to_owned_array().axis_iter(Axis(0)))
+            .zip(indices.to_owned_array().axis_iter(Axis(0)))
+            .map(|((prob, amplitudes), indices)| {
+                let index_amplitudes = indices
+                    .axis_iter(Axis(0))
+                    .zip(amplitudes.iter().cloned())
+                    .map(|(indx, c)| (indx.iter().cloned().collect(), Complex::new(c.re, c.im)))
+                    .collect();
+                (prob, index_amplitudes)
+            })
+            .collect();
+        let mds = MultiDefectStateRaw::<8>::new_mixed(state, n_sites, n_defects, num_experiments)
+            .map_err(PyValueError::new_err)?;
+        Ok(Self { mds })
+    }
+
+    pub fn apply_layer(&mut self, offset: bool) {
+        self.mds.apply_brick_layer(offset, false)
+    }
+
+    pub fn apply_alternative_layers(&mut self, n_layers: usize) {
+        for i in 0..n_layers {
+            // Layers alternate between offset and not-offset.
+            self.apply_layer(i % 2 == 1);
+        }
+    }
+
+    /// Get the state of the system.
+    pub fn get_state(&self, py: Python) -> (Py<PyArray1<f64>>, Py<PyArray3<c64>>) {
+        let probs = self.mds.details.probs.to_pyarray(py).to_owned();
+        let states = self.mds.experiment_states.to_pyarray(py).to_owned();
+        (probs, states)
+    }
+
+    pub fn get_enumerated_states(&self) -> Vec<Vec<usize>> {
+        self.mds
+            .details
+            .enumerated_states
+            .iter()
+            .map(|x| x.to_vec())
+            .collect()
+    }
+
+    pub fn get_mean_purity(&self) -> f64 {
+        let purities = self.mds.get_purity_iterator();
+        purities.sum::<f64>() / (self.mds.experiment_states.shape()[0] as f64)
+    }
+
+    pub fn get_all_purities(&self, py: Python) -> Py<PyArray1<f64>> {
+        let purity_iterator = self.mds.get_purity_iterator();
+        let mut purities = Array1::<f64>::zeros((self.mds.experiment_states.shape()[0],));
+        purity_iterator
+            .zip(purities.axis_iter_mut(Axis(0)).into_par_iter())
+            .for_each(|(pa, mut pb)| {
+                // Should just be 1.
+                pb.iter_mut().for_each(|pb| *pb = pa);
+            });
+        purities.into_pyarray(py).to_owned()
+    }
+
+    /// Compute the purity at each layer of the process and save to a numpy array.
+    pub fn apply_alternative_layers_and_save_mean_purity(
+        &mut self,
+        py: Python,
+        n_layers: usize,
+    ) -> PyResult<Py<PyArray1<f64>>> {
+        let mut res = Array1::zeros((n_layers,));
+        self.apply_alternative_layers_and_store_mean_purity(res.iter_mut());
+        Ok(res.into_pyarray(py).to_owned())
+    }
 }
 
 struct StateDetails<const N: usize> {
     num_defects: usize,
     num_sites: usize,
+    probs: Array1<f64>,
     enumerated_states: Vec<SmallVec<[usize; N]>>,
     /// vector of index deltas for moving the nth defect from `p` to `p+1`.
     index_deltas: Vec<usize>,
@@ -21,70 +175,128 @@ struct StateDetails<const N: usize> {
 
 /// const generic tunes memory usage to optimize for num_defects <= N.
 pub struct MultiDefectStateRaw<const N: usize> {
-    experiment_states: Vec<MixedState>,
+    experiment_states: Array3<Complex<f64>>,
     details: StateDetails<N>,
 }
 
 impl<const N: usize> MultiDefectStateRaw<N> {
     fn new_pure(
-        num_experiments: usize,
         state: Vec<(Vec<usize>, Complex<f64>)>,
-        n_defects: usize,
         n_sites: usize,
-    ) -> Self {
-        Self::new_mixed(num_experiments, vec![(1.0, state)], n_defects, n_sites)
+        n_defects: usize,
+        num_experiments: Option<usize>,
+    ) -> Result<Self, String> {
+        Self::new_mixed(vec![(1.0, state)], n_sites, n_defects, num_experiments)
+    }
+
+    fn check_input(
+        state: &Vec<(f64, Vec<(Vec<usize>, Complex<f64>)>)>,
+        n_sites: usize,
+        n_defects: usize,
+    ) -> Option<String> {
+        let mut sum_p = 0.0;
+        for (p, s) in state {
+            sum_p += *p;
+            let mut sum_amp = 0.0;
+            for (indx, amp) in s {
+                sum_amp += amp.norm_sqr();
+
+                let correct_length = indx.len() == n_defects;
+                if !correct_length {
+                    return Some(format!(
+                        "Expected state descriptors of length {}, found {:?}",
+                        n_defects, indx
+                    ));
+                }
+
+                let in_order = indx
+                    .iter()
+                    .cloned()
+                    .map(|x| x as i64)
+                    .try_fold(
+                        -1,
+                        |last, curr| {
+                            if last < curr {
+                                Ok(curr)
+                            } else {
+                                Err(())
+                            }
+                        },
+                    )
+                    .is_ok();
+                if !in_order {
+                    return Some(format!(
+                        "Expected state descriptors to be ordered, found {:?}",
+                        indx
+                    ));
+                }
+
+                for x in indx {
+                    if *x >= n_sites {
+                        return Some(format!(
+                            "Expected site occupations to be less than {}, found {:?}",
+                            n_sites, indx
+                        ));
+                    }
+                }
+            }
+            if (sum_amp - 1.0).abs() > f64::EPSILON {
+                return Some(format!(
+                    "Expected amplitudes squared to sum to 1.0 found {}",
+                    sum_amp
+                ));
+            }
+        }
+        if (sum_p - 1.0).abs() > f64::EPSILON {
+            return Some(format!(
+                "Expected probabilities to sum to 1.0 found {}",
+                sum_p
+            ));
+        }
+        None
     }
 
     fn new_mixed(
-        num_experiments: usize,
         state: Vec<(f64, Vec<(Vec<usize>, Complex<f64>)>)>,
-        n_defects: usize,
         n_sites: usize,
-    ) -> Self {
-        // Check all states are valid.
-        debug_assert!({
-            state
-                .iter()
-                .flat_map(|(_, s)| {
-                    s.iter().flat_map(|(s, _)| {
-                        let correct_length = s.len() == n_defects;
-                        let in_order = s
-                            .iter()
-                            .cloned()
-                            .map(|x| x as i64)
-                            .try_fold(
-                                -1,
-                                |last, curr| {
-                                    if last < curr {
-                                        Ok(curr)
-                                    } else {
-                                        Err(())
-                                    }
-                                },
-                            )
-                            .is_ok();
-                        s.iter().cloned().map(move |x| {
-                            let bounded_by_sites = x < n_sites;
-                            correct_length && in_order && bounded_by_sites
-                        })
-                    })
-                })
-                .all(|x| x)
-        });
+        n_defects: usize,
+        num_experiments: Option<usize>,
+    ) -> Result<Self, String> {
+        let num_experiments = num_experiments.unwrap_or(1);
+
+        // Check the states are valid.
+        let err = Self::check_input(&state, n_sites, n_defects);
+        if let Some(err) = err {
+            return Err(err);
+        }
 
         // Convert occupation representation into index representation.
         let enumerated_states = Self::enumerate_states(n_sites, n_defects);
-        let full_state = state
-            .into_iter()
-            .map(|(w, s)| {
-                let mut new_state = vec![Complex::zero(); enumerated_states.len()];
-                s.into_iter().for_each(|(s, w)| {
-                    let state_index = index_of_state(&s, &enumerated_states).unwrap();
-                    new_state[state_index] = w;
-                });
-                (w, new_state)
-            })
-            .collect::<Vec<_>>();
+
+        let mut probs = Array1::zeros((state.len(),));
+        probs
+            .iter_mut()
+            .zip(state.iter())
+            .for_each(|(arr_w, (w, _))| {
+                *arr_w = *w;
+            });
+
+        let mut full_state = Array3::zeros((num_experiments, state.len(), enumerated_states.len()));
+        full_state
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .for_each(|mut mixed_state| {
+                mixed_state
+                    .axis_iter_mut(Axis(0))
+                    .into_par_iter()
+                    .zip(state.par_iter())
+                    .for_each(|(mut arr_state, (_, s))| {
+                        s.iter().for_each(|(s, w)| {
+                            let state_index = index_of_state(s, &enumerated_states).unwrap();
+                            arr_state[state_index] = *w;
+                        });
+                    })
+            });
 
         let index_deltas = make_index_deltas(n_sites, n_defects);
 
@@ -98,20 +310,17 @@ impl<const N: usize> MultiDefectStateRaw<N> {
                 })
             });
 
-        Self {
-            experiment_states: (0..num_experiments)
-                .map(|_| MixedState {
-                    state: full_state.clone(),
-                })
-                .collect(),
+        Ok(Self {
+            experiment_states: full_state,
             details: StateDetails {
                 num_defects: n_defects,
                 num_sites: n_sites,
+                probs,
                 enumerated_states,
                 index_deltas,
                 occupied_indices,
             },
-        }
+        })
     }
 
     fn apply_brick_layer(&mut self, offset: bool, periodic_boundaries: bool) {
@@ -119,70 +328,72 @@ impl<const N: usize> MultiDefectStateRaw<N> {
             unimplemented!()
         }
         let offset = if offset { 1 } else { 0 };
-        self.experiment_states.par_iter_mut().for_each(|mixed_state| {
-            let mut rng = rand::thread_rng();
-            (0..self.details.num_sites/2).for_each(|i| {
-                let p = 2*i + offset;
-                let mat = make_unitary(&mut rng);
-                let phase = 2f64*std::f64::consts::PI*rng.gen::<f64>();
-                Self::apply_matrix(mixed_state, &self.details, p, &mat, phase);
-            });
-        })
+        self.experiment_states
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .for_each(|mut mixed_state| {
+                let mut rng = rand::thread_rng();
+                (0..(self.details.num_sites - offset) / 2).for_each(|i| {
+                    let p = 2 * i + offset;
+                    let mat = make_unitary(&mut rng);
+                    let phase = 2f64 * std::f64::consts::PI * rng.gen::<f64>();
+                    mixed_state
+                        .axis_iter_mut(Axis(0))
+                        .into_par_iter()
+                        .for_each(|mut s| {
+                            Self::apply_matrix(&mut s, &self.details, p, &mat, phase);
+                        });
+                });
+            })
     }
 
     /// Apply a matrix linking p and p+1, if both are occupied apply phase instead.
-    fn apply_matrix(
-        mixed_state: &mut MixedState,
+    fn apply_matrix<S>(
+        s: &mut S,
         details: &StateDetails<N>,
         p: usize,
         exchange_mat: &[Complex<f64>; 4],
         adj_phase: f64,
-    ) {
+    ) where
+        S: IndexMut<usize, Output = Complex<f64>> + ?Sized,
+    {
         // Does not handle periodic boundary conditions.
-        debug_assert!(p < details.num_sites-1);
+        debug_assert!(p < details.num_sites - 1);
 
-        mixed_state.state.par_iter_mut().for_each(|(_, s)| {
-            // Go through all states with occupation on p or p+1
-            // States with p and p+1 will appear twice.
-            details.occupied_indices[p]
-                .iter()
-                .cloned()
-                .for_each(|(index, defect)| {
-                    // index has an occupation on p or p+1 or both.
-                    let state = &details.enumerated_states[index];
-                    // Check for adjacent occupations first
-                    let adjacent_occ =  {
-                        debug_assert_eq!(state[defect], p);
-                        if defect < details.num_defects - 1 {
-                            // If there can be another defect, check if its at p+1
-                            state[defect + 1] == p + 1
-                        } else {
-                            // If there can't be another, then no adjacency.
-                            false
-                        }
-                    };
-                    if adjacent_occ {
-                            // If adjacency then add a phase.
-                            // Only apply phase once
-                            s[index] *= Complex::from_polar(1.0, adj_phase);
+        // Go through all states with occupation on p or p+1
+        // States with p and p+1 will appear twice.
+        details.occupied_indices[p]
+            .iter()
+            .cloned()
+            .for_each(|(index, defect)| {
+                // index has an occupation on p or p+1 or both.
+                let state = &details.enumerated_states[index];
+                // Check for adjacent occupations first
+                let adjacent_occ = {
+                    debug_assert_eq!(state[defect], p);
+                    if defect < details.num_defects - 1 {
+                        // If there can be another defect, check if its at p+1
+                        state[defect + 1] == p + 1
                     } else {
-                        // Otherwise mix between sites.
-                        let delta = details.index_deltas[p * details.num_defects + defect];
-                        let other_index = index + delta;
-                        let mut a = s[index];
-                        let mut b = s[other_index];
-                        apply_matrix(&mut a, &mut b, exchange_mat);
-                        s[index] = a;
-                        s[other_index] = b;
+                        // If there can't be another, then no adjacency.
+                        false
                     }
-                });
-        });
-    }
-
-    /// Compute the purity estimator of the state and return as a floating point value.
-    pub fn get_purities(&self) -> impl Iterator<Item=f64> {
-        todo!();
-        Some(0.0).into_iter()
+                };
+                if adjacent_occ {
+                    // If adjacency then add a phase.
+                    // Only apply phase once
+                    s[index] *= Complex::from_polar(1.0, adj_phase);
+                } else {
+                    // Otherwise mix between sites.
+                    let delta = details.index_deltas[p * details.num_defects + defect];
+                    let other_index = index + delta;
+                    let mut a = s[index];
+                    let mut b = s[other_index];
+                    apply_matrix(&mut a, &mut b, exchange_mat);
+                    s[index] = a;
+                    s[other_index] = b;
+                }
+            });
     }
 
     fn enumerate_states(sites: usize, defects: usize) -> Vec<SmallVec<[usize; N]>> {
@@ -190,64 +401,163 @@ impl<const N: usize> MultiDefectStateRaw<N> {
         enumerate_rec(&mut states, smallvec![], defects - 1, 0, sites);
         states
     }
+
+    /// Compute the purity estimator of the state and return as a floating point value.
+    pub fn get_purity_iterator(&self) -> impl IndexedParallelIterator<Item = f64> + '_ {
+        let hilbert_d = self.details.enumerated_states.len();
+        self.experiment_states
+            .axis_iter(Axis(0))
+            .into_par_iter()
+            .map(move |state| -> f64 {
+                if state.shape()[0] == 1 {
+                    // Fast way
+                    let state = state.slice(s![0, ..]);
+                    // F = D ( sum_s p(s)^2 - D sum_{s!=s'} p(s)p(s') )
+                    // p(s) = |<s|u|i>|^2
+                    // internal state is u|i>
+
+                    // First term is sum over |psi(i)|^4
+                    let first_term = state.iter().map(|c| c.norm_sqr().powi(2)).sum::<f64>();
+
+                    // Second term is 2 sum_s p(s) ( sum_{s'>s} p(s') )
+                    // Can build the sum_{s'>s} backwards from the end to turn O(n^2) into O(n)
+                    let fs = state.iter().rev().map(Complex::norm_sqr);
+                    let half_second_term = sum_s_sprime_iterator(fs, 0.0, 0.0);
+                    let second_term = 2.0 * half_second_term / (hilbert_d as f64);
+
+                    first_term - second_term
+                } else {
+                    // Slower way
+                    // first_term = sum_s ( sum_alpha p_alpha |<s|U|alpha>|^2)^2
+                    let first_term = state
+                        .axis_iter(Axis(1))
+                        .into_par_iter()
+                        .map(|s_for_each_mix| {
+                            s_for_each_mix
+                                .iter()
+                                .zip(self.details.probs.iter())
+                                .map(|(c, p_alpha)| *p_alpha * c.norm_sqr())
+                                .sum::<f64>()
+                                .powi(2)
+                        })
+                        .sum::<f64>();
+
+                    let probs = &self.details.probs;
+                    let f = |s: usize| -> f64 {
+                        state
+                            .slice(s![.., s])
+                            .iter()
+                            .zip(probs.iter().cloned())
+                            .map(|(c, p_alpha)| p_alpha * c.norm_sqr())
+                            .sum::<f64>()
+                    };
+                    let half_second_term =
+                        sum_s_sprime_iterator((0..hilbert_d).rev().map(f), 0.0, 0.0);
+
+                    let second_term = 2.0 * half_second_term / (hilbert_d as f64);
+
+                    first_term - second_term
+                }
+            })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use num_traits::One;
     use super::*;
+    use num_traits::One;
+    use numpy::ndarray::s;
 
     #[test]
     fn test_apply_ident() {
-        let mut states = MultiDefectStateRaw::<1>::new_pure(1, vec![(vec![0], Complex::one())], 1, 2);
-        let old_state = states.experiment_states[0].state[0].1.clone();
+        let mut states =
+            MultiDefectStateRaw::<1>::new_pure(vec![(vec![0], Complex::one())], 2, 1, Some(1));
+        let old_state = states
+            .experiment_states
+            .slice(s![0, 0, ..])
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
 
-        let mat = [Complex::one(), Complex::zero(), Complex::zero(), Complex::one()];
-        MultiDefectStateRaw::apply_matrix(&mut states.experiment_states[0], &states.details, 0, &mat, 0.0);
-
-        let new_state = states.experiment_states[0].state[0].1.clone();
+        let mat = [
+            Complex::one(),
+            Complex::zero(),
+            Complex::zero(),
+            Complex::one(),
+        ];
+        let mut new_state = old_state.clone();
+        MultiDefectStateRaw::apply_matrix(new_state.as_mut_slice(), &states.details, 0, &mat, 0.0);
         assert_eq!(old_state, new_state);
     }
 
     #[test]
     fn test_apply_flip() {
-        let mut states = MultiDefectStateRaw::<1>::new_pure(1, vec![(vec![0], Complex::one())], 1, 2);
-        let old_state = states.experiment_states[0].state[0].1.clone();
-
-        let mat = [Complex::zero(), Complex::one(), Complex::one(), Complex::zero()];
-        MultiDefectStateRaw::apply_matrix(&mut states.experiment_states[0], &states.details, 0, &mat, 0.0);
-
-        let mut new_state = states.experiment_states[0].state[0].1.clone();
+        let mut states =
+            MultiDefectStateRaw::<1>::new_pure(vec![(vec![0], Complex::one())], 2, 1, Some(1));
+        let old_state = states
+            .experiment_states
+            .slice(s![0, 0, ..])
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mat = [
+            Complex::zero(),
+            Complex::one(),
+            Complex::one(),
+            Complex::zero(),
+        ];
+        let mut new_state = old_state.clone();
+        MultiDefectStateRaw::apply_matrix(new_state.as_mut_slice(), &states.details, 0, &mat, 0.0);
         new_state.reverse();
         assert_eq!(old_state, new_state);
     }
 
     #[test]
     fn test_apply_flip_three() {
-        let mut states = MultiDefectStateRaw::<1>::new_pure(1, vec![(vec![0], Complex::one())], 1, 3);
-        let old_state = states.experiment_states[0].state[0].1.clone();
+        let mut states =
+            MultiDefectStateRaw::<1>::new_pure(vec![(vec![0], Complex::one())], 3, 1, Some(1));
+        let old_state = states
+            .experiment_states
+            .slice(s![0, 0, ..])
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mat = [
+            Complex::zero(),
+            Complex::one(),
+            Complex::one(),
+            Complex::zero(),
+        ];
 
-        let mat = [Complex::zero(), Complex::one(), Complex::one(), Complex::zero()];
-        MultiDefectStateRaw::apply_matrix(&mut states.experiment_states[0], &states.details, 0, &mat, 0.0);
-        MultiDefectStateRaw::apply_matrix(&mut states.experiment_states[0], &states.details, 1, &mat, 0.0);
+        let mut new_state = old_state.clone();
+        MultiDefectStateRaw::apply_matrix(new_state.as_mut_slice(), &states.details, 0, &mat, 0.0);
+        MultiDefectStateRaw::apply_matrix(new_state.as_mut_slice(), &states.details, 1, &mat, 0.0);
 
-        let mut new_state = states.experiment_states[0].state[0].1.clone();
         new_state.reverse();
         assert_eq!(old_state, new_state);
     }
 
     #[test]
     fn test_apply_flip_multi() {
-        let mut states = MultiDefectStateRaw::<1>::new_pure(1, vec![(vec![0,2], Complex::one())], 2, 3);
-        // i=1
-        let old_state = states.experiment_states[0].state[0].1.clone();
+        let mut states =
+            MultiDefectStateRaw::<1>::new_pure(vec![(vec![0, 2], Complex::one())], 3, 2, Some(1));
+        let old_state = states
+            .experiment_states
+            .slice(s![0, 0, ..])
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
 
-        let mat = [Complex::zero(), Complex::one(), Complex::one(), Complex::zero()];
+        let mat = [
+            Complex::zero(),
+            Complex::one(),
+            Complex::one(),
+            Complex::zero(),
+        ];
+        let mut new_state = old_state.clone();
         // Takes |02> to |12>
         // Takes i=1 to i=2
-        MultiDefectStateRaw::apply_matrix(&mut states.experiment_states[0], &states.details, 0, &mat, 0.0);
-        // i=2
-        let mut new_state = states.experiment_states[0].state[0].1.clone();
+        MultiDefectStateRaw::apply_matrix(new_state.as_mut_slice(), &states.details, 0, &mat, 0.0);
         // i=1
         new_state.rotate_left(1);
 
