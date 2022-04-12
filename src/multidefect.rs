@@ -50,6 +50,10 @@ impl MultiDefectState {
         num_experiments: Option<usize>,
         skip_float_checks: Option<bool>,
     ) -> PyResult<Self> {
+        if indices.len() != amplitudes.shape()[0] {
+            return Err(PyValueError::new_err(format!("Expected {} amplitudes, found {}", indices.len(), amplitudes.shape()[0])));
+        }
+
         let state = indices
             .into_iter()
             .zip(amplitudes.to_owned_array().into_iter())
@@ -81,6 +85,31 @@ impl MultiDefectState {
         num_experiments: Option<usize>,
         skip_float_checks: Option<bool>,
     ) -> PyResult<Self> {
+        if let (
+            [indices_num_states, indices_num_defects],
+            [amplitudes_num_states],
+        ) = (indices.shape(), amplitudes.shape())
+        {
+            if *indices_num_defects != n_defects {
+                return Err(PyValueError::new_err(format!(
+                    "Expected {} defects, found indices for {}",
+                    n_defects, indices_num_defects
+                )));
+            }
+            if amplitudes_num_states != indices_num_states {
+                return Err(PyValueError::new_err(format!(
+                    "Expected {} state amplitudes, found {}",
+                    indices_num_states, amplitudes_num_states
+                )));
+            }
+        } else {
+            return Err(PyValueError::new_err(format!(
+                "Invalid array shapes ({},{}) expecting (2,1)",
+                indices.shape().len(),
+                amplitudes.shape().len()
+            )));
+        }
+
         let state = indices
             .to_owned_array()
             .axis_iter(Axis(0))
@@ -120,6 +149,45 @@ impl MultiDefectState {
         num_experiments: Option<usize>,
         skip_float_checks: Option<bool>,
     ) -> PyResult<Self> {
+        if let (
+            [indices_num_mixed, indices_num_states, indices_num_defects],
+            [probs_num_mixed],
+            [amplitudes_num_mixed, amplitudes_num_states],
+        ) = (indices.shape(), probs.shape(), amplitudes.shape())
+        {
+            if *indices_num_defects != n_defects {
+                return Err(PyValueError::new_err(format!(
+                    "Expected {} defects, found indices for {}",
+                    n_defects, indices_num_defects
+                )));
+            }
+            if probs_num_mixed != indices_num_mixed {
+                return Err(PyValueError::new_err(format!(
+                    "Expected {} mixed states, found indices for {}",
+                    probs_num_mixed, indices_num_mixed
+                )));
+            }
+            if probs_num_mixed != amplitudes_num_mixed {
+                return Err(PyValueError::new_err(format!(
+                    "Expected {} mixed states, found amplitudes for {}",
+                    probs_num_mixed, indices_num_mixed
+                )));
+            }
+            if amplitudes_num_states != indices_num_states {
+                return Err(PyValueError::new_err(format!(
+                    "Expected {} state amplitudes, found {}",
+                    indices_num_states, amplitudes_num_states
+                )));
+            }
+        } else {
+            return Err(PyValueError::new_err(format!(
+                "Invalid array shapes ({},{},{}) expecting (3,1,2)",
+                indices.shape().len(),
+                probs.shape().len(),
+                amplitudes.shape().len()
+            )));
+        }
+
         let state = probs
             .to_owned_array()
             .iter()
