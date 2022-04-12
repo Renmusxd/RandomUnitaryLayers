@@ -17,12 +17,18 @@ pub struct SingleDefectState {
 
 #[pymethods]
 impl SingleDefectState {
-    /// Construct a new instance.
+    /// Construct a new pure state using
+    /// `state`: Numpy array of complex amplitudes for each state `|i>` corresponding to occupation on site `i`
+    /// `num_experiments`: optionally run multiple independent runs in parallel (default to 1).
     #[new]
     fn new(state: PyReadonlyArray1<c64>, num_experiments: Option<usize>) -> PyResult<Self> {
         Self::new_mixed(vec![(1.0, state)], num_experiments)
     }
 
+    /// Construct a new mixed state using
+    /// `state`: List of probabilities and numpy arrays of complex amplitudes. Density matrix is
+    ///     sum of weighted pure states.
+    /// `num_experiments`: optionally run multiple independent runs in parallel (default to 1).
     #[staticmethod]
     fn new_mixed(
         state: Vec<(f64, PyReadonlyArray1<c64>)>,
@@ -63,6 +69,9 @@ impl SingleDefectState {
         Ok(Self { d, probs, states })
     }
 
+    /// Apply a single brick layer
+    /// `offset`: if true, bricks start at [1,2] instead of [0,1].
+    /// `periodic_boundaries`: if true, allows [N-1,0] brick, defaults to false.
     pub fn apply_layer(&mut self, offset: bool, periodic_boundaries: Option<bool>) {
         let periodic_boundaries = periodic_boundaries.unwrap_or_default();
         self.states
@@ -114,6 +123,8 @@ impl SingleDefectState {
             });
     }
 
+    /// Make example 2x2 unitaries.
+    /// `n`: number of unitaries to make
     pub fn make_unitaries(&self, py: Python, n: usize) -> PyResult<Py<PyArray3<c64>>> {
         let mut rng = rand::thread_rng();
         let mut res = Array3::zeros((n, 2, 2));
@@ -126,6 +137,8 @@ impl SingleDefectState {
     }
 
     /// Apply alternating layers of random unitaries.
+    /// `n_layers`: number of brick layers to apply
+    /// `periodic_boundaries`: whether to use periodic boundaries.
     pub fn apply_alternative_layers(&mut self, n_layers: usize, periodic_boundaries: Option<bool>) {
         for i in 0..n_layers {
             // Layers alternate between offset and not-offset.
@@ -133,18 +146,22 @@ impl SingleDefectState {
         }
     }
 
-    /// Get the state of the system.
+    /// Get the state of the system: `\rho = \sum p_\alpha U|\alpha><\alpha|U^\dagger`
+    /// Returns: Vector of `\alpha` and Matrix of `U|\alpha>` for each experiment.
+    /// Size of matrix is [experiments,len(alphas),n_sites].
     pub fn get_state(&self, py: Python) -> (Py<PyArray1<f64>>, Py<PyArray3<c64>>) {
         let probs = self.probs.to_pyarray(py).to_owned();
         let states = self.states.to_pyarray(py).to_owned();
         (probs, states)
     }
 
+    /// Get average purity estimator across all experiments
     pub fn get_mean_purity(&self) -> f64 {
         let purities = self.get_purity_iterator();
         purities.sum::<f64>() / (self.states.shape()[0] as f64)
     }
 
+    /// Get purity estimators for each experiment
     pub fn get_all_purities(&self, py: Python) -> Py<PyArray1<f64>> {
         let purity_iterator = self.get_purity_iterator();
         let mut purities = Array1::<f64>::zeros((self.states.shape()[0],));
@@ -158,6 +175,8 @@ impl SingleDefectState {
     }
 
     /// Compute the purity at each layer of the process and save to a numpy array.
+    /// `n_layers`: number of brick layers to apply
+    /// `periodic_boundaries`: whether to include periodic boundaries
     pub fn apply_alternative_layers_and_save_mean_purity(
         &mut self,
         py: Python,

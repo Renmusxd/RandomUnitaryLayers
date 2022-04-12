@@ -35,6 +35,12 @@ impl MultiDefectState {
 
 #[pymethods]
 impl MultiDefectState {
+    /// Construct a state with multiple defects
+    /// `indices`: list of occupation strings (represented as lists of indices of length n_defects).
+    /// `amplitudes`: numpy array of amplitudes, one per occupation string.
+    /// `n_sites`: number of sites on lattice.
+    /// `n_defects`: number of defects in system.
+    /// `num_experiments`: number of independent experiments to run.
     #[new]
     fn new(
         indices: Vec<Vec<usize>>,
@@ -42,17 +48,30 @@ impl MultiDefectState {
         n_sites: usize,
         n_defects: usize,
         num_experiments: Option<usize>,
+        skip_float_checks: Option<bool>,
     ) -> PyResult<Self> {
         let state = indices
             .into_iter()
             .zip(amplitudes.to_owned_array().into_iter())
             .map(|(indx, c)| (indx, Complex::new(c.re, c.im)))
             .collect();
-        let mds = MultiDefectStateRaw::<8>::new_pure(state, n_sites, n_defects, num_experiments)
-            .map_err(PyValueError::new_err)?;
+        let mds = MultiDefectStateRaw::<8>::new_pure(
+            state,
+            n_sites,
+            n_defects,
+            num_experiments,
+            skip_float_checks,
+        )
+        .map_err(PyValueError::new_err)?;
         Ok(Self { mds })
     }
 
+    /// Construct a state with multiple defects
+    /// `indices`: numpy array of occupations (represented as array of indices of length n_defects).
+    /// `amplitudes`: numpy array of amplitudes, one per occupation string.
+    /// `n_sites`: number of sites on lattice.
+    /// `n_defects`: number of defects in system.
+    /// `num_experiments`: number of independent experiments to run.
     #[staticmethod]
     fn new_pure(
         indices: PyReadonlyArray2<usize>,
@@ -60,6 +79,7 @@ impl MultiDefectState {
         n_sites: usize,
         n_defects: usize,
         num_experiments: Option<usize>,
+        skip_float_checks: Option<bool>,
     ) -> PyResult<Self> {
         let state = indices
             .to_owned_array()
@@ -72,11 +92,24 @@ impl MultiDefectState {
                 )
             })
             .collect();
-        let mds = MultiDefectStateRaw::<8>::new_pure(state, n_sites, n_defects, num_experiments)
-            .map_err(PyValueError::new_err)?;
+        let mds = MultiDefectStateRaw::<8>::new_pure(
+            state,
+            n_sites,
+            n_defects,
+            num_experiments,
+            skip_float_checks,
+        )
+        .map_err(PyValueError::new_err)?;
         Ok(Self { mds })
     }
 
+    /// Construct a state with multiple defects
+    /// `indices`: array of size [num mixed states, occupation strings, n_defects].
+    /// `probs`: numpy array of probabilities for mixed states of size [num mixed states].
+    /// `amplitudes`: numpy array of amplitudes of size [num mixed states, occupation strings].
+    /// `n_sites`: number of sites on lattice.
+    /// `n_defects`: number of defects in system.
+    /// `num_experiments`: number of independent experiments to run.
     #[staticmethod]
     fn new_mixed(
         indices: PyReadonlyArray3<usize>,
@@ -85,6 +118,7 @@ impl MultiDefectState {
         n_sites: usize,
         n_defects: usize,
         num_experiments: Option<usize>,
+        skip_float_checks: Option<bool>,
     ) -> PyResult<Self> {
         let state = probs
             .to_owned_array()
@@ -101,15 +135,24 @@ impl MultiDefectState {
                 (prob, index_amplitudes)
             })
             .collect();
-        let mds = MultiDefectStateRaw::<8>::new_mixed(state, n_sites, n_defects, num_experiments)
-            .map_err(PyValueError::new_err)?;
+        let mds = MultiDefectStateRaw::<8>::new_mixed(
+            state,
+            n_sites,
+            n_defects,
+            num_experiments,
+            skip_float_checks,
+        )
+        .map_err(PyValueError::new_err)?;
         Ok(Self { mds })
     }
 
+    /// Apply a single brick layer
+    /// `offset`: if true bricks start at [1,2], else [0,1]
     pub fn apply_layer(&mut self, offset: bool) {
         self.mds.apply_brick_layer(offset, false)
     }
 
+    /// Apply `n_layers` of alternating brick layers.
     pub fn apply_alternative_layers(&mut self, n_layers: usize) {
         for i in 0..n_layers {
             // Layers alternate between offset and not-offset.
@@ -124,6 +167,7 @@ impl MultiDefectState {
         (probs, states)
     }
 
+    /// Get the list of N defect states in occupation representation.
     pub fn get_enumerated_states(&self) -> Vec<Vec<usize>> {
         self.mds
             .details
@@ -133,11 +177,13 @@ impl MultiDefectState {
             .collect()
     }
 
+    /// Get the mean purity across all experiments.
     pub fn get_mean_purity(&self) -> f64 {
         let purities = self.mds.get_purity_iterator();
         purities.sum::<f64>() / (self.mds.experiment_states.shape()[0] as f64)
     }
 
+    /// Get the each experiments purity.
     pub fn get_all_purities(&self, py: Python) -> Py<PyArray1<f64>> {
         let purity_iterator = self.mds.get_purity_iterator();
         let mut purities = Array1::<f64>::zeros((self.mds.experiment_states.shape()[0],));
@@ -150,7 +196,7 @@ impl MultiDefectState {
         purities.into_pyarray(py).to_owned()
     }
 
-    /// Compute the purity at each layer of the process and save to a numpy array.
+    /// Compute the purity at each of `n_layers` and save to a numpy array.
     pub fn apply_alternative_layers_and_save_mean_purity(
         &mut self,
         py: Python,
@@ -185,15 +231,24 @@ impl<const N: usize> MultiDefectStateRaw<N> {
         n_sites: usize,
         n_defects: usize,
         num_experiments: Option<usize>,
+        skip_float_checks: Option<bool>,
     ) -> Result<Self, String> {
-        Self::new_mixed(vec![(1.0, state)], n_sites, n_defects, num_experiments)
+        Self::new_mixed(
+            vec![(1.0, state)],
+            n_sites,
+            n_defects,
+            num_experiments,
+            skip_float_checks,
+        )
     }
 
     fn check_input(
         state: &Vec<(f64, Vec<(Vec<usize>, Complex<f64>)>)>,
         n_sites: usize,
         n_defects: usize,
+        skip_float_checks: Option<bool>,
     ) -> Option<String> {
+        let skip_float_checks = skip_float_checks.unwrap_or_default();
         let mut sum_p = 0.0;
         for (p, s) in state {
             sum_p += *p;
@@ -240,14 +295,14 @@ impl<const N: usize> MultiDefectStateRaw<N> {
                     }
                 }
             }
-            if (sum_amp - 1.0).abs() > f64::EPSILON {
+            if !skip_float_checks && (sum_amp - 1.0).abs() > f64::EPSILON {
                 return Some(format!(
                     "Expected amplitudes squared to sum to 1.0 found {}",
                     sum_amp
                 ));
             }
         }
-        if (sum_p - 1.0).abs() > f64::EPSILON {
+        if !skip_float_checks && (sum_p - 1.0).abs() > f64::EPSILON {
             return Some(format!(
                 "Expected probabilities to sum to 1.0 found {}",
                 sum_p
@@ -261,11 +316,12 @@ impl<const N: usize> MultiDefectStateRaw<N> {
         n_sites: usize,
         n_defects: usize,
         num_experiments: Option<usize>,
+        skip_float_checks: Option<bool>,
     ) -> Result<Self, String> {
         let num_experiments = num_experiments.unwrap_or(1);
 
         // Check the states are valid.
-        let err = Self::check_input(&state, n_sites, n_defects);
+        let err = Self::check_input(&state, n_sites, n_defects, skip_float_checks);
         if let Some(err) = err {
             return Err(err);
         }
