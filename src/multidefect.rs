@@ -3,10 +3,10 @@ use crate::utils::{
     sum_s_sprime_iterator,
 };
 use num_complex::Complex;
-use numpy::ndarray::{s, Array1, Array3, Axis};
+use numpy::ndarray::{s, Array1, Array2, Array3, Axis};
 use numpy::{
-    c64, IntoPyArray, PyArray1, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
-    ToPyArray,
+    c64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3, ToPyArray,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -51,7 +51,11 @@ impl MultiDefectState {
         skip_float_checks: Option<bool>,
     ) -> PyResult<Self> {
         if indices.len() != amplitudes.shape()[0] {
-            return Err(PyValueError::new_err(format!("Expected {} amplitudes, found {}", indices.len(), amplitudes.shape()[0])));
+            return Err(PyValueError::new_err(format!(
+                "Expected {} amplitudes, found {}",
+                indices.len(),
+                amplitudes.shape()[0]
+            )));
         }
 
         let state = indices
@@ -85,10 +89,8 @@ impl MultiDefectState {
         num_experiments: Option<usize>,
         skip_float_checks: Option<bool>,
     ) -> PyResult<Self> {
-        if let (
-            [indices_num_states, indices_num_defects],
-            [amplitudes_num_states],
-        ) = (indices.shape(), amplitudes.shape())
+        if let ([indices_num_states, indices_num_defects], [amplitudes_num_states]) =
+            (indices.shape(), amplitudes.shape())
         {
             if *indices_num_defects != n_defects {
                 return Err(PyValueError::new_err(format!(
@@ -235,14 +237,35 @@ impl MultiDefectState {
         (probs, states)
     }
 
+    /// Get the list of N defect states in occupation representation for the current object.
+    pub fn get_enumerated_states(&self, py: Python) -> Py<PyArray2<usize>> {
+        let mut res = Array2::zeros((
+            self.mds.details.enumerated_states.len(),
+            self.mds.details.num_defects,
+        ));
+        res.axis_iter_mut(Axis(0))
+            .zip(self.mds.details.enumerated_states.iter())
+            .for_each(|(mut r, s)| {
+                r.iter_mut().zip(s.into_iter()).for_each(|(r, s)| *r = *s);
+            });
+        res.into_pyarray(py).to_owned()
+    }
+
     /// Get the list of N defect states in occupation representation.
-    pub fn get_enumerated_states(&self) -> Vec<Vec<usize>> {
-        self.mds
-            .details
-            .enumerated_states
-            .iter()
-            .map(|x| x.to_vec())
-            .collect()
+    #[staticmethod]
+    pub fn gen_enumerated_states(
+        py: Python,
+        num_sites: usize,
+        num_defects: usize,
+    ) -> Py<PyArray2<usize>> {
+        let states = MultiDefectStateRaw::<8>::enumerate_states(num_sites, num_defects);
+        let mut res = Array2::zeros((states.len(), num_defects));
+        res.axis_iter_mut(Axis(0))
+            .zip(states.into_iter())
+            .for_each(|(mut r, s)| {
+                r.iter_mut().zip(s.into_iter()).for_each(|(r, s)| *r = s);
+            });
+        res.into_pyarray(py).to_owned()
     }
 
     /// Get the mean purity across all experiments.
