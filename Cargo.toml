@@ -24,6 +24,7 @@ num-integer = ">=0.1"
 smallvec = {version = ">=1.8", features = ["const_generics"]}
 
 [dependencies.ndarray]
+version = "*"
 features = ["rayon"]
 
 [dependencies.pyo3]
