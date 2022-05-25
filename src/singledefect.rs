@@ -1,7 +1,7 @@
 use crate::utils::*;
 use num_complex::Complex;
 use numpy::ndarray::{s, Array1, Array3, Axis};
-use numpy::{c64, IntoPyArray, PyArray1, PyArray3, PyReadonlyArray1, ToPyArray};
+use numpy::{Complex64, IntoPyArray, PyArray1, PyArray3, PyReadonlyArray1, ToPyArray};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -21,7 +21,7 @@ impl SingleDefectState {
     /// `state`: Numpy array of complex amplitudes for each state `|i>` corresponding to occupation on site `i`
     /// `num_experiments`: optionally run multiple independent runs in parallel (default to 1).
     #[new]
-    fn new(state: PyReadonlyArray1<c64>, num_experiments: Option<usize>) -> PyResult<Self> {
+    fn new(state: PyReadonlyArray1<Complex64>, num_experiments: Option<usize>) -> PyResult<Self> {
         Self::new_mixed(vec![(1.0, state)], num_experiments)
     }
 
@@ -31,7 +31,7 @@ impl SingleDefectState {
     /// `num_experiments`: optionally run multiple independent runs in parallel (default to 1).
     #[staticmethod]
     fn new_mixed(
-        state: Vec<(f64, PyReadonlyArray1<c64>)>,
+        state: Vec<(f64, PyReadonlyArray1<Complex64>)>,
         num_experiments: Option<usize>,
     ) -> PyResult<Self> {
         let num_experiments = num_experiments.unwrap_or(1);
@@ -125,7 +125,7 @@ impl SingleDefectState {
 
     /// Make example 2x2 unitaries.
     /// `n`: number of unitaries to make
-    pub fn make_unitaries(&self, py: Python, n: usize) -> PyResult<Py<PyArray3<c64>>> {
+    pub fn make_unitaries(&self, py: Python, n: usize) -> PyResult<Py<PyArray3<Complex64>>> {
         let mut rng = rand::thread_rng();
         let mut res = Array3::zeros((n, 2, 2));
         res.axis_iter_mut(numpy::ndarray::Axis(0))
@@ -149,7 +149,7 @@ impl SingleDefectState {
     /// Get the state of the system: `\rho = \sum p_\alpha U|\alpha><\alpha|U^\dagger`
     /// Returns: Vector of `\alpha` and Matrix of `U|\alpha>` for each experiment.
     /// Size of matrix is [experiments,len(alphas),n_sites].
-    pub fn get_state(&self, py: Python) -> (Py<PyArray1<f64>>, Py<PyArray3<c64>>) {
+    pub fn get_state(&self, py: Python) -> (Py<PyArray1<f64>>, Py<PyArray3<Complex64>>) {
         let probs = self.probs.to_pyarray(py).to_owned();
         let states = self.states.to_pyarray(py).to_owned();
         (probs, states)

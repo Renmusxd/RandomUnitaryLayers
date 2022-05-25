@@ -1,11 +1,11 @@
 use crate::utils::{
-    apply_matrix, enumerate_rec, index_of_state, make_index_deltas, make_unitary,
-    sum_s_sprime_iterator,
+    apply_matrix, enumerate_rec, get_purity_iterator, index_of_state, make_index_deltas,
+    make_unitary,
 };
 use num_complex::Complex;
-use numpy::ndarray::{s, Array1, Array2, Array3, Axis};
+use numpy::ndarray::{Array1, Array2, Array3, Axis};
 use numpy::{
-    c64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
+    Complex64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
     PyReadonlyArray3, ToPyArray,
 };
 use pyo3::exceptions::PyValueError;
@@ -44,7 +44,7 @@ impl MultiDefectState {
     #[new]
     fn new(
         indices: Vec<Vec<usize>>,
-        amplitudes: PyReadonlyArray1<c64>,
+        amplitudes: PyReadonlyArray1<Complex64>,
         n_sites: usize,
         n_defects: usize,
         num_experiments: Option<usize>,
@@ -83,7 +83,7 @@ impl MultiDefectState {
     #[staticmethod]
     fn new_pure(
         indices: PyReadonlyArray2<usize>,
-        amplitudes: PyReadonlyArray1<c64>,
+        amplitudes: PyReadonlyArray1<Complex64>,
         n_sites: usize,
         n_defects: usize,
         num_experiments: Option<usize>,
@@ -145,7 +145,7 @@ impl MultiDefectState {
     fn new_mixed(
         indices: PyReadonlyArray3<usize>,
         probs: PyReadonlyArray1<f64>,
-        amplitudes: PyReadonlyArray2<c64>,
+        amplitudes: PyReadonlyArray2<Complex64>,
         n_sites: usize,
         n_defects: usize,
         num_experiments: Option<usize>,
@@ -231,7 +231,7 @@ impl MultiDefectState {
     }
 
     /// Get the state of the system.
-    pub fn get_state(&self, py: Python) -> (Py<PyArray1<f64>>, Py<PyArray3<c64>>) {
+    pub fn get_state(&self, py: Python) -> (Py<PyArray1<f64>>, Py<PyArray3<Complex64>>) {
         let probs = self.mds.details.probs.to_pyarray(py).to_owned();
         let states = self.mds.experiment_states.to_pyarray(py).to_owned();
         (probs, states)
@@ -552,73 +552,27 @@ impl<const N: usize> MultiDefectStateRaw<N> {
     /// Compute the purity estimator of the state and return as a floating point value.
     pub fn get_purity_iterator(&self) -> impl IndexedParallelIterator<Item = f64> + '_ {
         let hilbert_d = self.details.enumerated_states.len();
-        self.experiment_states
-            .axis_iter(Axis(0))
-            .into_par_iter()
-            .map(move |state| -> f64 {
-                if state.shape()[0] == 1 {
-                    // Fast way
-                    let state = state.slice(s![0, ..]);
-                    // F = D ( sum_s p(s)^2 - D sum_{s!=s'} p(s)p(s') )
-                    // p(s) = |<s|u|i>|^2
-                    // internal state is u|i>
-
-                    // First term is sum over |psi(i)|^4
-                    let first_term = state.iter().map(|c| c.norm_sqr().powi(2)).sum::<f64>();
-
-                    // Second term is 2 sum_s p(s) ( sum_{s'>s} p(s') )
-                    // Can build the sum_{s'>s} backwards from the end to turn O(n^2) into O(n)
-                    let fs = state.iter().rev().map(Complex::norm_sqr);
-                    let half_second_term = sum_s_sprime_iterator(fs, 0.0, 0.0);
-                    let second_term = 2.0 * half_second_term / (hilbert_d as f64);
-
-                    first_term - second_term
-                } else {
-                    // Slower way
-                    // first_term = sum_s ( sum_alpha p_alpha |<s|U|alpha>|^2)^2
-                    let first_term = state
-                        .axis_iter(Axis(1))
-                        .into_par_iter()
-                        .map(|s_for_each_mix| {
-                            s_for_each_mix
-                                .iter()
-                                .zip(self.details.probs.iter())
-                                .map(|(c, p_alpha)| *p_alpha * c.norm_sqr())
-                                .sum::<f64>()
-                                .powi(2)
-                        })
-                        .sum::<f64>();
-
-                    let probs = &self.details.probs;
-                    let f = |s: usize| -> f64 {
-                        state
-                            .slice(s![.., s])
-                            .iter()
-                            .zip(probs.iter().cloned())
-                            .map(|(c, p_alpha)| p_alpha * c.norm_sqr())
-                            .sum::<f64>()
-                    };
-                    let half_second_term =
-                        sum_s_sprime_iterator((0..hilbert_d).rev().map(f), 0.0, 0.0);
-
-                    let second_term = 2.0 * half_second_term / (hilbert_d as f64);
-
-                    first_term - second_term
-                }
-            })
+        let probs = self.details.probs.as_slice().unwrap();
+        let amps = &self.experiment_states;
+        get_purity_iterator(hilbert_d, probs, amps)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use num_traits::One;
+    use num_traits::{One, Zero};
     use numpy::ndarray::s;
 
     #[test]
-    fn test_apply_ident() {
-        let mut states =
-            MultiDefectStateRaw::<1>::new_pure(vec![(vec![0], Complex::one())], 2, 1, Some(1));
+    fn test_apply_ident() -> Result<(), String> {
+        let states = MultiDefectStateRaw::<1>::new_pure(
+            vec![(vec![0], Complex::one())],
+            2,
+            1,
+            Some(1),
+            Some(true),
+        )?;
         let old_state = states
             .experiment_states
             .slice(s![0, 0, ..])
@@ -635,12 +589,18 @@ mod tests {
         let mut new_state = old_state.clone();
         MultiDefectStateRaw::apply_matrix(new_state.as_mut_slice(), &states.details, 0, &mat, 0.0);
         assert_eq!(old_state, new_state);
+        Ok(())
     }
 
     #[test]
-    fn test_apply_flip() {
-        let mut states =
-            MultiDefectStateRaw::<1>::new_pure(vec![(vec![0], Complex::one())], 2, 1, Some(1));
+    fn test_apply_flip() -> Result<(), String> {
+        let states = MultiDefectStateRaw::<1>::new_pure(
+            vec![(vec![0], Complex::one())],
+            2,
+            1,
+            Some(1),
+            Some(true),
+        )?;
         let old_state = states
             .experiment_states
             .slice(s![0, 0, ..])
@@ -657,12 +617,18 @@ mod tests {
         MultiDefectStateRaw::apply_matrix(new_state.as_mut_slice(), &states.details, 0, &mat, 0.0);
         new_state.reverse();
         assert_eq!(old_state, new_state);
+        Ok(())
     }
 
     #[test]
-    fn test_apply_flip_three() {
-        let mut states =
-            MultiDefectStateRaw::<1>::new_pure(vec![(vec![0], Complex::one())], 3, 1, Some(1));
+    fn test_apply_flip_three() -> Result<(), String> {
+        let states = MultiDefectStateRaw::<1>::new_pure(
+            vec![(vec![0], Complex::one())],
+            3,
+            1,
+            Some(1),
+            Some(true),
+        )?;
         let old_state = states
             .experiment_states
             .slice(s![0, 0, ..])
@@ -682,12 +648,18 @@ mod tests {
 
         new_state.reverse();
         assert_eq!(old_state, new_state);
+        Ok(())
     }
 
     #[test]
-    fn test_apply_flip_multi() {
-        let mut states =
-            MultiDefectStateRaw::<1>::new_pure(vec![(vec![0, 2], Complex::one())], 3, 2, Some(1));
+    fn test_apply_flip_multi() -> Result<(), String> {
+        let states = MultiDefectStateRaw::<1>::new_pure(
+            vec![(vec![0, 2], Complex::one())],
+            3,
+            2,
+            Some(1),
+            Some(true),
+        )?;
         let old_state = states
             .experiment_states
             .slice(s![0, 0, ..])
@@ -709,5 +681,6 @@ mod tests {
         new_state.rotate_left(1);
 
         assert_eq!(old_state, new_state);
+        Ok(())
     }
 }
