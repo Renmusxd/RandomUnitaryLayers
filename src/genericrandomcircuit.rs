@@ -311,96 +311,63 @@ struct Dets {
     state_index: usize,
 }
 
-fn run_on_each_state_parallel<F>(
+fn run_on_each_state_parallel<F, G, T>(
     amps: &Array3<Complex<f64>>,
     buff: &mut Array3<Complex<f64>>,
-    states: &Array3<usize>,
     f: F,
+    state_setup: G,
 ) where
-    F: Fn(
-            (
-                Dets,
-                ArrayView2<usize>,
-                ArrayView1<Complex<f64>>,
-                &mut Complex<f64>,
-            ),
-        ) + Send
-        + Sync
-        + Copy,
+    F: Fn(Dets, ArrayView1<Complex<f64>>, &mut Complex<f64>, &T) + Send + Sync + Copy,
+    G: Fn(usize) -> T + Send + Sync,
+    T: Send + Sync,
 {
-    amps.axis_iter(Axis(0))
+    buff.axis_iter_mut(Axis(2))
         .into_par_iter()
-        .zip(buff.axis_iter_mut(Axis(0)).into_par_iter())
         .enumerate()
-        .for_each(|(r, (amps, mut buff))| {
-            // Iterate mixed states
-            amps.axis_iter(Axis(0))
+        .for_each(|(state_index, mut buff)| {
+            let t = state_setup(state_index);
+            ndarray::Zip::indexed(buff)
                 .into_par_iter()
-                .zip(buff.axis_iter_mut(Axis(0)).into_par_iter())
-                .for_each(|(amps, mut buff)| {
-                    // Iterate quantum states
-                    buff.axis_iter_mut(Axis(0))
-                        .into_par_iter()
-                        .zip(states.axis_iter(Axis(0)).into_par_iter())
-                        .enumerate()
-                        .map(|(state_index, (buff, s))| {
-                            (
-                                Dets {
-                                    replica: r,
-                                    state_index,
-                                },
-                                s,
-                                amps,
-                                buff.into_iter().next().unwrap(),
-                            )
-                        })
-                        .for_each(f)
+                .for_each(|((r, m), b)| {
+                    let amps = amps.slice(s![r, m, ..]);
+                    f(
+                        Dets {
+                            replica: r,
+                            state_index,
+                        },
+                        amps,
+                        b,
+                        &t,
+                    )
                 });
         });
 }
 
-fn run_on_each_state<F>(
+fn run_on_each_state<F, G, T>(
     amps: &Array3<Complex<f64>>,
     buff: &mut Array3<Complex<f64>>,
-    states: &Array3<usize>,
     f: F,
+    state_setup: G,
 ) where
-    F: Fn(
-            (
-                Dets,
-                ArrayView2<usize>,
-                ArrayView1<Complex<f64>>,
-                &mut Complex<f64>,
-            ),
-        ) + Send
-        + Sync
-        + Copy,
+    F: Fn(Dets, ArrayView1<Complex<f64>>, &mut Complex<f64>, &T) + Send + Sync + Copy,
+    G: Fn(usize) -> T,
 {
-    amps.axis_iter(Axis(0))
-        .zip(buff.axis_iter_mut(Axis(0)))
+    buff.axis_iter_mut(Axis(2))
         .enumerate()
-        .for_each(|(r, (amps, mut buff))| {
-            // Iterate mixed states
-            amps.axis_iter(Axis(0))
-                .zip(buff.axis_iter_mut(Axis(0)))
-                .for_each(|(amps, mut buff)| {
-                    // Iterate quantum states
-                    buff.axis_iter_mut(Axis(0))
-                        .zip(states.axis_iter(Axis(0)))
-                        .enumerate()
-                        .map(|(state_index, (buff, s))| {
-                            (
-                                Dets {
-                                    replica: r,
-                                    state_index,
-                                },
-                                s,
-                                amps,
-                                buff.into_iter().next().unwrap(),
-                            )
-                        })
-                        .for_each(f)
-                });
+        .for_each(|(state_index, mut buff)| {
+            let t = state_setup(state_index);
+            ndarray::Zip::indexed(buff).for_each(|(r, m), b| {
+                let amps = amps.slice(s![r, m, ..]);
+                f(
+                    Dets {
+                        replica: r,
+                        state_index,
+                    },
+                    amps,
+                    b,
+                    &t,
+                )
+            });
         });
 }
 
@@ -433,72 +400,83 @@ impl GenericMultiDefectState {
                 .connection_to_groups
                 .slice(s![connection_index, ..]);
 
-            let f = |(index, s, amps, buff): (
-                Dets,
-                ArrayView2<usize>,
-                ArrayView1<Complex<f64>>,
-                &mut Complex<f64>,
-            )| {
-                let a_m = s[(a, 0)];
-                let b_m = s[(b, 0)];
+            let g = |state_index| -> (usize, usize, ArrayView1<usize>) {
+                let a_m = states[(state_index, a, 0)];
+                let b_m = states[(state_index, b, 0)];
                 let n_sector = a_m + b_m;
 
-                let start_index = group_pointers[(index.state_index, 0)];
-                let output_mat_index = group_pointers[(index.state_index, 1)];
+                let start_index = group_pointers[(state_index, 0)];
+                let output_mat_index = group_pointers[(state_index, 1)];
                 let n_sector_size = connections.n_sector_sizes[n_sector];
                 let relevant_state_indices =
                     groups.slice(s![start_index..start_index + n_sector_size]);
 
+                (n_sector, output_mat_index, relevant_state_indices)
+            };
+
+            let f = |index: Dets,
+                     amps: ArrayView1<Complex<f64>>,
+                     buff: &mut Complex<f64>,
+                     (n_sector, output_mat_index, relevant_state_indices): &(
+                usize,
+                usize,
+                ArrayView1<usize>,
+            )| {
                 *buff = relevant_state_indices
                     .into_iter()
                     .copied()
                     .enumerate()
                     .map(|(mat_index, state_index)| {
-                        let uij = unitary(index.replica, n_sector, (output_mat_index, mat_index));
+                        let uij = unitary(index.replica, *n_sector, (*output_mat_index, mat_index));
                         uij * amps[state_index]
                     })
                     .sum::<Complex<f64>>();
             };
 
             if self.parallel_mats {
-                run_on_each_state_parallel(&amps, &mut buff, &states, f);
+                run_on_each_state_parallel(&amps, &mut buff, f, g);
             } else {
-                run_on_each_state(&amps, &mut buff, &states, f);
+                run_on_each_state(&amps, &mut buff, f, g);
             }
         } else {
-            let f = |(index, s, amps, buff): (
-                Dets,
-                ArrayView2<usize>,
-                ArrayView1<Complex<f64>>,
-                &mut Complex<f64>,
-            )| {
-                let r = index.replica;
-                let index = index.state_index;
+            let g = |state_index| {
+                let s = states.slice(s![state_index, .., ..]);
                 let a_m = s[(a, 0)];
                 let b_m = s[(b, 0)];
                 let n_sector = a_m + b_m;
                 let (output_mat_index, relevant_state_indices) = self
                     .get_relevant_states_for_n_sector(
-                        index,
+                        state_index,
                         s.axis_iter(Axis(0)).map(|t| (t[0], t[1])),
                         a,
                         b,
                     );
+                (n_sector, output_mat_index, relevant_state_indices)
+            };
 
+            let f = |index: Dets,
+                     amps: ArrayView1<Complex<f64>>,
+                     buff: &mut Complex<f64>,
+                     (n_sector, output_mat_index, relevant_state_indices): &(
+                usize,
+                usize,
+                Vec<usize>,
+            )| {
+                let r = index.replica;
                 *buff = relevant_state_indices
                     .into_iter()
                     .enumerate()
                     .map(|(mat_index, state_index)| {
-                        let uij = unitary(r, n_sector, (output_mat_index, mat_index));
-                        uij * amps[state_index]
+                        let uij = unitary(r, *n_sector, (*output_mat_index, mat_index));
+                        uij * amps[*state_index]
                     })
                     .sum::<Complex<f64>>();
             };
 
             if self.parallel_mats {
-                run_on_each_state_parallel(&amps, &mut buff, &states, f);
+                run_on_each_state_parallel(&amps, &mut buff, f, g);
             } else {
-                run_on_each_state(&amps, &mut buff, &states, f);
+                run_on_each_state(&amps, &mut buff, f, g);
             }
         }
         self.states = Some(states);
@@ -715,7 +693,6 @@ fn make_cmat(l: usize, n: usize, ds: &[usize]) -> Array2<usize> {
 #[cfg(test)]
 mod generic_tests {
     use super::*;
-    use numpy::ndarray::s;
 
     #[test]
     fn cmat_test() {
@@ -735,7 +712,8 @@ mod generic_tests {
     #[test]
     fn get_index() {
         // Test getting each index for a L=4 N=2 system with nontrivial de
-        let multistate = GenericMultiDefectState::new(4, 2, vec![2, 2, 1, 0, 0], None, None, None);
+        let multistate =
+            GenericMultiDefectState::new(4, 2, vec![2, 2, 1, 0, 0], None, None, None, None);
         let states = multistate.get_raw_states().clone();
         states.axis_iter(Axis(0)).for_each(|state| {
             let state_index = multistate
@@ -756,7 +734,8 @@ mod generic_tests {
     #[test]
     fn get_index_packed() {
         // Test getting each index for a L=4 N=2 system with nontrivial de
-        let multistate = GenericMultiDefectState::new(4, 2, vec![2, 2, 0, 0, 0], None, None, None);
+        let multistate =
+            GenericMultiDefectState::new(4, 2, vec![2, 2, 0, 0, 0], None, None, None, None);
         let states = multistate.get_raw_states().clone();
         states.axis_iter(Axis(0)).for_each(|state| {
             let state_index = multistate
@@ -777,7 +756,7 @@ mod generic_tests {
     #[test]
     fn test_get_relevant_entries() {
         let ds = vec![2, 2, 1, 0, 0];
-        let multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None);
+        let multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
         let example_state = [(1, 0), (1, 0), (0, 0), (0, 0)];
         let a = 0;
         let b = 1;
@@ -808,7 +787,7 @@ mod generic_tests {
     #[test]
     fn test_get_relevant_entries_mix() {
         let ds = vec![2, 2, 1, 0, 0];
-        let multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None);
+        let multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
         let example_state = [(1, 0), (1, 0), (0, 0), (0, 0)];
         let a = 0;
         let b = 2;
@@ -837,7 +816,7 @@ mod generic_tests {
     #[test]
     fn test_apply_matrix_two_sector() {
         let ds = vec![1, 1, 1, 0, 0];
-        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None);
+        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
 
         let (a, b) = (0, 1);
         let n_sector = 2;
@@ -878,7 +857,7 @@ mod generic_tests {
     #[test]
     fn test_apply_matrix_one_sector() {
         let ds = vec![1, 1, 1, 0, 0];
-        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None);
+        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
 
         let (a, b) = (1, 2);
         let n_sector = 1;
@@ -918,14 +897,14 @@ mod generic_tests {
 
     #[test]
     fn test_layer() {
-        let mut g = GenericMultiDefectState::new(20, 5, vec![1, 1], None, None, None);
+        let mut g = GenericMultiDefectState::new(20, 5, vec![1, 1], None, None, None, None);
         g.apply_layer()
     }
 
     #[test]
     fn test_precompute_apply_matrix_two_sector() {
         let ds = vec![1, 1, 1, 0, 0];
-        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None);
+        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
         multistate.precompute_connections();
 
         let (a, b) = (0, 1);
@@ -967,7 +946,7 @@ mod generic_tests {
     #[test]
     fn test_precompute_apply_matrix_one_sector() {
         let ds = vec![1, 1, 1, 0, 0];
-        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None);
+        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
         multistate.precompute_connections();
 
         let (a, b) = (1, 2);
