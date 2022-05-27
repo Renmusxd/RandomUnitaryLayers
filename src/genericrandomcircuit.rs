@@ -715,7 +715,6 @@ fn make_cmat(l: usize, n: usize, ds: &[usize]) -> Array2<usize> {
 #[cfg(test)]
 mod generic_tests {
     use super::*;
-    use numpy::ndarray::s;
 
     #[test]
     fn cmat_test() {
@@ -735,7 +734,8 @@ mod generic_tests {
     #[test]
     fn get_index() {
         // Test getting each index for a L=4 N=2 system with nontrivial de
-        let multistate = GenericMultiDefectState::new(4, 2, vec![2, 2, 1, 0, 0], None, None, None);
+        let multistate =
+            GenericMultiDefectState::new(4, 2, vec![2, 2, 1, 0, 0], None, None, None, None);
         let states = multistate.get_raw_states().clone();
         states.axis_iter(Axis(0)).for_each(|state| {
             let state_index = multistate
@@ -756,7 +756,8 @@ mod generic_tests {
     #[test]
     fn get_index_packed() {
         // Test getting each index for a L=4 N=2 system with nontrivial de
-        let multistate = GenericMultiDefectState::new(4, 2, vec![2, 2, 0, 0, 0], None, None, None);
+        let multistate =
+            GenericMultiDefectState::new(4, 2, vec![2, 2, 0, 0, 0], None, None, None, None);
         let states = multistate.get_raw_states().clone();
         states.axis_iter(Axis(0)).for_each(|state| {
             let state_index = multistate
@@ -777,7 +778,7 @@ mod generic_tests {
     #[test]
     fn test_get_relevant_entries() {
         let ds = vec![2, 2, 1, 0, 0];
-        let multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None);
+        let multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
         let example_state = [(1, 0), (1, 0), (0, 0), (0, 0)];
         let a = 0;
         let b = 1;
@@ -808,7 +809,7 @@ mod generic_tests {
     #[test]
     fn test_get_relevant_entries_mix() {
         let ds = vec![2, 2, 1, 0, 0];
-        let multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None);
+        let multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
         let example_state = [(1, 0), (1, 0), (0, 0), (0, 0)];
         let a = 0;
         let b = 2;
@@ -837,7 +838,7 @@ mod generic_tests {
     #[test]
     fn test_apply_matrix_two_sector() {
         let ds = vec![1, 1, 1, 0, 0];
-        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None);
+        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
 
         let (a, b) = (0, 1);
         let n_sector = 2;
@@ -878,7 +879,7 @@ mod generic_tests {
     #[test]
     fn test_apply_matrix_one_sector() {
         let ds = vec![1, 1, 1, 0, 0];
-        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None);
+        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
 
         let (a, b) = (1, 2);
         let n_sector = 1;
@@ -918,14 +919,14 @@ mod generic_tests {
 
     #[test]
     fn test_layer() {
-        let mut g = GenericMultiDefectState::new(20, 5, vec![1, 1], None, None, None);
+        let mut g = GenericMultiDefectState::new(20, 5, vec![1, 1], None, None, None, None);
         g.apply_layer()
     }
 
     #[test]
     fn test_precompute_apply_matrix_two_sector() {
         let ds = vec![1, 1, 1, 0, 0];
-        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None);
+        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
         multistate.precompute_connections();
 
         let (a, b) = (0, 1);
@@ -967,7 +968,7 @@ mod generic_tests {
     #[test]
     fn test_precompute_apply_matrix_one_sector() {
         let ds = vec![1, 1, 1, 0, 0];
-        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None);
+        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
         multistate.precompute_connections();
 
         let (a, b) = (1, 2);
