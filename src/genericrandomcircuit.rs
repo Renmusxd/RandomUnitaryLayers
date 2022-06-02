@@ -1,10 +1,13 @@
 use crate::utils::get_purity_iterator;
-use ndarray::{s, ArrayView1, ArrayView2};
+use ndarray::{s, ArrayView1};
 use ndarray_linalg::QR;
 use num_complex::Complex;
 use num_traits::{One, Zero};
 use numpy::ndarray::{Array1, Array2, Array3, Axis};
-use numpy::{Complex64, PyArray1, PyArray2, PyArray3, PyReadonlyArray2, ToPyArray};
+use numpy::{
+    Complex64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
+    ToPyArray,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rand::rngs::SmallRng;
@@ -50,7 +53,8 @@ impl GenericMultiDefectState {
         layer: Option<Vec<(usize, usize)>>,
         seeds: Option<Vec<u64>>,
         parallel_matrix_mul: Option<bool>,
-    ) -> Self {
+        initial_state: Option<(PyReadonlyArray1<f64>, PyReadonlyArray2<Complex<f64>>)>,
+    ) -> PyResult<Self> {
         let parallel_mats = parallel_matrix_mul.unwrap_or(true);
         while ds.len() <= n {
             ds.push(0)
@@ -94,12 +98,57 @@ impl GenericMultiDefectState {
                 .chain((0..l / 2 - 1).map(|i| (2 * i + 1, 2 * i + 2)))
                 .collect()
         });
+        layer_connections.iter().copied().try_for_each(|(a, b)| {
+            if a >= l || b >= l {
+                Err(PyValueError::new_err(format!(
+                    "Connection ({}, {}) exceeds maximum index {} (L={})",
+                    a,
+                    b,
+                    l - 1,
+                    l
+                )))
+            } else {
+                Ok(())
+            }
+        })?;
+
         let layer_connections = Some(layer_connections);
 
-        let num_mixed = 1;
+        let (num_mixed, probs, amplitudes) = if let Some((probs, amplitudes)) = initial_state {
+            let num_mixed = probs.shape()[0];
+            let probs = probs.to_owned_array();
+            let single_amplitudes = amplitudes.to_owned_array();
 
-        let probs = Array1::zeros((num_mixed,));
-        let amplitudes = Array3::zeros((num_experiments, num_mixed, hilbert_d));
+            if single_amplitudes.shape()[0] != num_mixed {
+                return Err(PyValueError::new_err(format!(
+                    "Amplitudes shape: {:?} does not match number of mixed states: {}",
+                    single_amplitudes.shape()[0],
+                    num_mixed,
+                )));
+            }
+            if single_amplitudes.shape()[1] != hilbert_d {
+                return Err(PyValueError::new_err(format!(
+                    "Amplitudes shape: {:?} does not match number of states: {}",
+                    single_amplitudes.shape()[1],
+                    hilbert_d,
+                )));
+            }
+
+            let mut amplitudes = Array3::zeros((num_experiments, num_mixed, hilbert_d));
+            ndarray::Zip::indexed(&mut amplitudes)
+                .into_par_iter()
+                .for_each(|((_, nm, s), a)| *a = single_amplitudes[(nm, s)]);
+
+            (num_mixed, probs, amplitudes)
+        } else {
+            let mut amps = Array3::zeros((num_experiments, 1, hilbert_d));
+            for ne in 0..num_experiments {
+                amps[(ne, 0, 0)] = Complex::one()
+            }
+
+            (1, Array1::ones((1,)), amps)
+        };
+
         let buffer = amplitudes.clone();
         let mut s = Self {
             l,
@@ -121,7 +170,7 @@ impl GenericMultiDefectState {
                 a[(i, j, 0)] = Complex::one();
             }
         }
-        s
+        Ok(s)
     }
 
     fn get_states(&self, py: Python) -> Py<PyArray3<usize>> {
@@ -134,6 +183,8 @@ impl GenericMultiDefectState {
         random_unitary(n, &mut rng).to_pyarray(py).to_owned()
     }
 
+    /// A layer is defined as the complete set of all connections in the graph.
+    /// For a brick circuit, this includes even and odd connections.
     fn apply_layer(&mut self) {
         let mut rngs = self.rngs.take().unwrap();
         let layer_conn = self.layer_connections.take().unwrap();
@@ -180,6 +231,17 @@ impl GenericMultiDefectState {
         purities.sum::<f64>() / (self.num_experiments as f64)
     }
 
+    /// Compute the purity at each of `n_layers` and save to a numpy array.
+    pub fn apply_layers_and_save_mean_purity(
+        &mut self,
+        py: Python,
+        n_layers: usize,
+    ) -> PyResult<Py<PyArray1<f64>>> {
+        let mut res = Array1::zeros((n_layers,));
+        self.apply_alternative_layers_and_store_mean_purity(res.iter_mut());
+        Ok(res.into_pyarray(py).to_owned())
+    }
+
     fn get_precompute_size(&self) -> usize {
         let states = self.states.as_ref().unwrap().shape()[0];
         let layers = self.layer_connections.as_ref().unwrap().len();
@@ -212,14 +274,14 @@ impl GenericMultiDefectState {
                 .enumerate()
                 .for_each(|(conn_i, (a, b))| connections[(a, b)] = conn_i);
             layers
-                .iter()
+                .par_iter()
                 .copied()
                 .zip(
                     state_pointers
                         .axis_iter_mut(Axis(0))
-                        .zip(state_groups.axis_iter_mut(Axis(0))),
+                        .into_par_iter()
+                        .zip(state_groups.axis_iter_mut(Axis(0)).into_par_iter()),
                 )
-                .par_bridge()
                 .for_each(|((a, b), (mut pointers, mut groups))| {
                     let mut group_start_pos = 0;
                     states
@@ -324,7 +386,7 @@ fn run_on_each_state_parallel<F, G, T>(
     buff.axis_iter_mut(Axis(2))
         .into_par_iter()
         .enumerate()
-        .for_each(|(state_index, mut buff)| {
+        .for_each(|(state_index, buff)| {
             let t = state_setup(state_index);
             ndarray::Zip::indexed(buff)
                 .into_par_iter()
@@ -354,7 +416,7 @@ fn run_on_each_state<F, G, T>(
 {
     buff.axis_iter_mut(Axis(2))
         .enumerate()
-        .for_each(|(state_index, mut buff)| {
+        .for_each(|(state_index, buff)| {
             let t = state_setup(state_index);
             ndarray::Zip::indexed(buff).for_each(|(r, m), b| {
                 let amps = amps.slice(s![r, m, ..]);
@@ -372,6 +434,17 @@ fn run_on_each_state<F, G, T>(
 }
 
 impl GenericMultiDefectState {
+    /// Compute the purity at each layer of the process and save to a numpy array.
+    pub fn apply_alternative_layers_and_store_mean_purity<'a, It>(&mut self, purity_iterator: It)
+    where
+        It: IntoIterator<Item = &'a mut f64>,
+    {
+        purity_iterator.into_iter().for_each(|f| {
+            self.apply_layer();
+            *f = self.get_mean_purity();
+        });
+    }
+
     /// Applies the matrix unitary, represented by a function f(replica, n_sector, (r,c))
     fn apply_matrix<F>(&mut self, a: usize, b: usize, unitary: F)
     where
@@ -464,7 +537,7 @@ impl GenericMultiDefectState {
             )| {
                 let r = index.replica;
                 *buff = relevant_state_indices
-                    .into_iter()
+                    .iter()
                     .enumerate()
                     .map(|(mat_index, state_index)| {
                         let uij = unitary(r, *n_sector, (*output_mat_index, mat_index));
@@ -713,7 +786,8 @@ mod generic_tests {
     fn get_index() {
         // Test getting each index for a L=4 N=2 system with nontrivial de
         let multistate =
-            GenericMultiDefectState::new(4, 2, vec![2, 2, 1, 0, 0], None, None, None, None);
+            GenericMultiDefectState::new(4, 2, vec![2, 2, 1, 0, 0], None, None, None, None, None)
+                .expect("Failed to make graph");
         let states = multistate.get_raw_states().clone();
         states.axis_iter(Axis(0)).for_each(|state| {
             let state_index = multistate
@@ -735,7 +809,8 @@ mod generic_tests {
     fn get_index_packed() {
         // Test getting each index for a L=4 N=2 system with nontrivial de
         let multistate =
-            GenericMultiDefectState::new(4, 2, vec![2, 2, 0, 0, 0], None, None, None, None);
+            GenericMultiDefectState::new(4, 2, vec![2, 2, 0, 0, 0], None, None, None, None, None)
+                .expect("Failed to make graph");
         let states = multistate.get_raw_states().clone();
         states.axis_iter(Axis(0)).for_each(|state| {
             let state_index = multistate
@@ -756,13 +831,15 @@ mod generic_tests {
     #[test]
     fn test_get_relevant_entries() {
         let ds = vec![2, 2, 1, 0, 0];
-        let multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
+        let multistate =
+            GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None, None)
+                .expect("Failed to make graph");
         let example_state = [(1, 0), (1, 0), (0, 0), (0, 0)];
         let a = 0;
         let b = 1;
-        let example_index = multistate.get_index_for_state(example_state.clone());
+        let example_index = multistate.get_index_for_state(example_state);
         let (out, rels) =
-            multistate.get_relevant_states_for_n_sector(example_index, example_state.clone(), a, b);
+            multistate.get_relevant_states_for_n_sector(example_index, example_state, a, b);
         assert_eq!(out, 2);
         let mut deduped_rels = rels.clone();
         deduped_rels.dedup();
@@ -774,8 +851,7 @@ mod generic_tests {
         let states = multistate.get_raw_states();
         rels.into_iter()
             .map(|index| states.slice(s![index, .., ..]))
-            .enumerate()
-            .for_each(|(index, val)| {
+            .for_each(|val| {
                 let val = val
                     .axis_iter(Axis(0))
                     .map(|a| (a[0], a[1]))
@@ -787,13 +863,15 @@ mod generic_tests {
     #[test]
     fn test_get_relevant_entries_mix() {
         let ds = vec![2, 2, 1, 0, 0];
-        let multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
+        let multistate =
+            GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None, None)
+                .expect("Failed to make graph");
         let example_state = [(1, 0), (1, 0), (0, 0), (0, 0)];
         let a = 0;
         let b = 2;
-        let example_index = multistate.get_index_for_state(example_state.clone());
+        let example_index = multistate.get_index_for_state(example_state);
         let (out, rels) =
-            multistate.get_relevant_states_for_n_sector(example_index, example_state.clone(), a, b);
+            multistate.get_relevant_states_for_n_sector(example_index, example_state, a, b);
 
         assert_eq!(out, 4);
         let mut deduped_rels = rels.clone();
@@ -803,8 +881,7 @@ mod generic_tests {
         let states = multistate.get_raw_states();
         rels.into_iter()
             .map(|index| states.slice(s![index, .., ..]))
-            .enumerate()
-            .for_each(|(index, val)| {
+            .for_each(|val| {
                 let val = val
                     .axis_iter(Axis(0))
                     .map(|a| (a[0], a[1]))
@@ -816,28 +893,26 @@ mod generic_tests {
     #[test]
     fn test_apply_matrix_two_sector() {
         let ds = vec![1, 1, 1, 0, 0];
-        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
+        let mut multistate = GenericMultiDefectState::new(4, 2, ds, None, None, None, None, None)
+            .expect("Failed to make graph");
 
         let (a, b) = (0, 1);
         let n_sector = 2;
 
         let example_state = [(2, 0), (0, 0), (0, 0), (0, 0)];
-        let flipped_state = [(1, 0), (1, 0), (0, 0), (0, 0)];
         // there's also (0,0), (2,0) around.
         assert_eq!(multistate.states_in_sector(2), 3);
-        let example_index = multistate.get_index_for_state(example_state.clone());
+        let example_index = multistate.get_index_for_state(example_state);
 
         let relevant_states =
-            multistate.get_relevant_states_for_n_sector(example_index, example_state.clone(), a, b);
+            multistate.get_relevant_states_for_n_sector(example_index, example_state, a, b);
 
         let (_, amps) = multistate.get_amplitudes_mut();
         amps.iter_mut().for_each(|a| *a = Complex::zero());
         amps[(0, 0, example_index)] = Complex::one();
 
         multistate.apply_matrix(a, b, |_, n, pos| {
-            if n == n_sector {
-                Complex::one()
-            } else if pos.0 == pos.1 {
+            if n == n_sector || pos.0 == pos.1 {
                 Complex::one()
             } else {
                 Complex::zero()
@@ -857,28 +932,26 @@ mod generic_tests {
     #[test]
     fn test_apply_matrix_one_sector() {
         let ds = vec![1, 1, 1, 0, 0];
-        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
+        let mut multistate = GenericMultiDefectState::new(4, 2, ds, None, None, None, None, None)
+            .expect("Failed to make graph");
 
         let (a, b) = (1, 2);
         let n_sector = 1;
 
         let example_state = [(1, 0), (1, 0), (0, 0), (0, 0)];
-        let flipped_state = [(1, 0), (0, 0), (1, 0), (0, 0)];
         // there's also (0,0), (2,0) around.
         assert_eq!(multistate.states_in_sector(1), 2);
-        let example_index = multistate.get_index_for_state(example_state.clone());
+        let example_index = multistate.get_index_for_state(example_state);
 
         let relevant_states =
-            multistate.get_relevant_states_for_n_sector(example_index, example_state.clone(), a, b);
+            multistate.get_relevant_states_for_n_sector(example_index, example_state, a, b);
 
         let (_, amps) = multistate.get_amplitudes_mut();
         amps.iter_mut().for_each(|a| *a = Complex::zero());
         amps[(0, 0, example_index)] = Complex::one();
 
         multistate.apply_matrix(a, b, |_, n, pos| {
-            if n == n_sector {
-                Complex::one()
-            } else if pos.0 == pos.1 {
+            if n == n_sector || pos.0 == pos.1 {
                 Complex::one()
             } else {
                 Complex::zero()
@@ -897,36 +970,35 @@ mod generic_tests {
 
     #[test]
     fn test_layer() {
-        let mut g = GenericMultiDefectState::new(20, 5, vec![1, 1], None, None, None, None);
+        let mut g = GenericMultiDefectState::new(20, 5, vec![1, 1], None, None, None, None, None)
+            .expect("Failed to make graph");
         g.apply_layer()
     }
 
     #[test]
     fn test_precompute_apply_matrix_two_sector() {
         let ds = vec![1, 1, 1, 0, 0];
-        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
+        let mut multistate = GenericMultiDefectState::new(4, 2, ds, None, None, None, None, None)
+            .expect("Failed to make graph");
         multistate.precompute_connections();
 
         let (a, b) = (0, 1);
         let n_sector = 2;
 
         let example_state = [(2, 0), (0, 0), (0, 0), (0, 0)];
-        let flipped_state = [(1, 0), (1, 0), (0, 0), (0, 0)];
         // there's also (0,0), (2,0) around.
         assert_eq!(multistate.states_in_sector(2), 3);
-        let example_index = multistate.get_index_for_state(example_state.clone());
+        let example_index = multistate.get_index_for_state(example_state);
 
         let relevant_states =
-            multistate.get_relevant_states_for_n_sector(example_index, example_state.clone(), a, b);
+            multistate.get_relevant_states_for_n_sector(example_index, example_state, a, b);
 
         let (_, amps) = multistate.get_amplitudes_mut();
         amps.iter_mut().for_each(|a| *a = Complex::zero());
         amps[(0, 0, example_index)] = Complex::one();
 
         multistate.apply_matrix(a, b, |_, n, pos| {
-            if n == n_sector {
-                Complex::one()
-            } else if pos.0 == pos.1 {
+            if n == n_sector || pos.0 == pos.1 {
                 Complex::one()
             } else {
                 Complex::zero()
@@ -946,29 +1018,27 @@ mod generic_tests {
     #[test]
     fn test_precompute_apply_matrix_one_sector() {
         let ds = vec![1, 1, 1, 0, 0];
-        let mut multistate = GenericMultiDefectState::new(4, 2, ds.clone(), None, None, None, None);
+        let mut multistate = GenericMultiDefectState::new(4, 2, ds, None, None, None, None, None)
+            .expect("Failed to make graph");
         multistate.precompute_connections();
 
         let (a, b) = (1, 2);
         let n_sector = 1;
 
         let example_state = [(1, 0), (1, 0), (0, 0), (0, 0)];
-        let flipped_state = [(1, 0), (0, 0), (1, 0), (0, 0)];
         // there's also (0,0), (2,0) around.
         assert_eq!(multistate.states_in_sector(1), 2);
-        let example_index = multistate.get_index_for_state(example_state.clone());
+        let example_index = multistate.get_index_for_state(example_state);
 
         let relevant_states =
-            multistate.get_relevant_states_for_n_sector(example_index, example_state.clone(), a, b);
+            multistate.get_relevant_states_for_n_sector(example_index, example_state, a, b);
 
         let (_, amps) = multistate.get_amplitudes_mut();
         amps.iter_mut().for_each(|a| *a = Complex::zero());
         amps[(0, 0, example_index)] = Complex::one();
 
         multistate.apply_matrix(a, b, |_, n, pos| {
-            if n == n_sector {
-                Complex::one()
-            } else if pos.0 == pos.1 {
+            if n == n_sector || pos.0 == pos.1 {
                 Complex::one()
             } else {
                 Complex::zero()
