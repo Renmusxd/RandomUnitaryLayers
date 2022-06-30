@@ -31,6 +31,36 @@ impl MultiDefectState {
             *f = self.get_mean_purity();
         });
     }
+
+    /// Compute the purity at each layer of the process and save to a numpy array.
+    pub fn apply_alternative_layers_and_store_mean_purity_and_density<'a, It, Arr>(
+        &mut self,
+        iterator: It,
+    ) where
+        Arr: IndexMut<usize, Output = f64>,
+        It: IntoIterator<Item = (&'a mut f64, Arr)>,
+    {
+        iterator
+            .into_iter()
+            .enumerate()
+            .for_each(|(i, (f, mut rho))| {
+                self.apply_layer(i % 2 == 1);
+                *f = self.get_mean_purity();
+
+                let states = &self.mds.details.enumerated_states;
+                let probs = &self.mds.details.probs;
+                let ne = self.mds.experiment_states.shape()[0];
+
+                ndarray::Zip::indexed(&self.mds.experiment_states).for_each(
+                    |(exp, mix, state), amp| {
+                        let dens = amp.norm_sqr() * probs[mix] / (ne as f64);
+                        states[state].iter().copied().for_each(|defect_index| {
+                            rho[defect_index] += dens;
+                        })
+                    },
+                );
+            });
+    }
 }
 
 #[pymethods]
@@ -296,6 +326,22 @@ impl MultiDefectState {
         let mut res = Array1::zeros((n_layers,));
         self.apply_alternative_layers_and_store_mean_purity(res.iter_mut());
         Ok(res.into_pyarray(py).to_owned())
+    }
+
+    /// Compute the purity and density at each of `n_layers` and save to a numpy array.
+    pub fn apply_alternative_layers_and_save_mean_purity_and_density(
+        &mut self,
+        py: Python,
+        n_layers: usize,
+    ) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray2<f64>>)> {
+        let mut res = Array1::zeros((n_layers,));
+        let mut dens = Array2::zeros((n_layers, self.mds.details.num_sites));
+        let iter = res.iter_mut().zip(dens.axis_iter_mut(Axis(0)));
+        self.apply_alternative_layers_and_store_mean_purity_and_density(iter);
+        Ok((
+            res.into_pyarray(py).to_owned(),
+            dens.into_pyarray(py).to_owned(),
+        ))
     }
 }
 
