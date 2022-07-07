@@ -153,60 +153,34 @@ pub fn make_index_deltas(n_sites: usize, n_defects: usize) -> Vec<usize> {
 }
 
 /// Compute the purity estimator of the state and return as a floating point value.
+/// Assumes Tr(rho) = 1.0
+/// Calculates D(sum_{s,s'} (-D)^{-delta_{s,s'}} P(s) P(s')
+/// Can be rearranged into (D+1)sum_s P(s)^2 - (sum_s P(s))^2
+/// That is was it calculated here, assuming sum_s P(s) = 1.0
 pub fn get_purity_iterator<'a>(
     hilbert_d: usize,
     probs: &'a [f64],
     amps: &'a Array3<Complex<f64>>,
 ) -> impl IndexedParallelIterator<Item = f64> + 'a {
+    // Iterate across experiments
     amps.axis_iter(Axis(0))
         .into_par_iter()
         .map(move |state| -> f64 {
-            if state.shape()[0] == 1 {
-                // Fast way
-                let state = state.slice(s![0, ..]);
-                // F = D ( sum_s p(s)^2 - 1/D sum_{s!=s'} p(s)p(s') )
-                // p(s) = |<s|u|i>|^2
-                // internal state is u|i>
-
-                // First term is sum over |psi(i)|^4
-                let first_term = state.iter().map(|c| c.norm_sqr().powi(2)).sum::<f64>();
-
-                // Second term is 2 sum_s p(s) ( sum_{s'>s} p(s') )
-                // Can build the sum_{s'>s} backwards from the end to turn O(n^2) into O(n)
-                let fs = state.iter().rev().map(Complex::norm_sqr);
-                let half_second_term = sum_s_sprime_iterator(fs, 0.0, 0.0);
-                let second_term = 2.0 * half_second_term;
-
-                (hilbert_d as f64) * first_term - second_term
-            } else {
-                // Slower way
-                // first_term = sum_s ( sum_alpha p_alpha |<s|U|alpha>|^2)^2
-                let first_term = state
-                    .axis_iter(Axis(1))
+            (hilbert_d + 1) as f64
+                * state
+                    .axis_iter(Axis(1)) // Iterate across states
                     .into_par_iter()
-                    .map(|s_for_each_mix| {
-                        s_for_each_mix
+                    .map(|mixes| {
+                        // Iterate across mixtures and their probabilities
+                        mixes
                             .iter()
-                            .zip(probs.iter())
-                            .map(|(c, p_alpha)| *p_alpha * c.norm_sqr())
+                            .zip(probs)
+                            .map(|(amp, prob)| *prob * amp.norm_sqr())
                             .sum::<f64>()
                             .powi(2)
                     })
-                    .sum::<f64>();
-
-                let f = |s: usize| -> f64 {
-                    state
-                        .slice(s![.., s])
-                        .iter()
-                        .zip(probs.iter().cloned())
-                        .map(|(c, p_alpha)| p_alpha * c.norm_sqr())
-                        .sum::<f64>()
-                };
-                let half_second_term = sum_s_sprime_iterator((0..hilbert_d).rev().map(f), 0.0, 0.0);
-                let second_term = 2.0 * half_second_term;
-
-                (hilbert_d as f64) * first_term - second_term
-            }
+                    .sum::<f64>()
+                - 1.0
         })
 }
 
