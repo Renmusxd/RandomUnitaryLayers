@@ -164,7 +164,7 @@ pub fn get_purity_iterator<'a>(
             if state.shape()[0] == 1 {
                 // Fast way
                 let state = state.slice(s![0, ..]);
-                // F = D ( sum_s p(s)^2 - D sum_{s!=s'} p(s)p(s') )
+                // F = D ( sum_s p(s)^2 - 1/D sum_{s!=s'} p(s)p(s') )
                 // p(s) = |<s|u|i>|^2
                 // internal state is u|i>
 
@@ -175,9 +175,9 @@ pub fn get_purity_iterator<'a>(
                 // Can build the sum_{s'>s} backwards from the end to turn O(n^2) into O(n)
                 let fs = state.iter().rev().map(Complex::norm_sqr);
                 let half_second_term = sum_s_sprime_iterator(fs, 0.0, 0.0);
-                let second_term = 2.0 * half_second_term / (hilbert_d as f64);
+                let second_term = 2.0 * half_second_term;
 
-                first_term - second_term
+                (hilbert_d as f64) * first_term - second_term
             } else {
                 // Slower way
                 // first_term = sum_s ( sum_alpha p_alpha |<s|U|alpha>|^2)^2
@@ -203,10 +203,9 @@ pub fn get_purity_iterator<'a>(
                         .sum::<f64>()
                 };
                 let half_second_term = sum_s_sprime_iterator((0..hilbert_d).rev().map(f), 0.0, 0.0);
+                let second_term = 2.0 * half_second_term;
 
-                let second_term = 2.0 * half_second_term / (hilbert_d as f64);
-
-                first_term - second_term
+                (hilbert_d as f64) * first_term - second_term
             }
         })
 }
