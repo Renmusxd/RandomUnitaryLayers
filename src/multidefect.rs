@@ -52,7 +52,7 @@ impl MultiDefectState {
                 let ne = self.mds.experiment_states.shape()[0];
 
                 ndarray::Zip::indexed(&self.mds.experiment_states).for_each(
-                    |(exp, mix, state), amp| {
+                    |(_exp, mix, state), amp| {
                         let dens = amp.norm_sqr() * probs[mix] / (ne as f64);
                         states[state].iter().copied().for_each(|defect_index| {
                             rho[defect_index] += dens;
