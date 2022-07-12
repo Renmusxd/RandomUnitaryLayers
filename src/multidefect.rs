@@ -1,7 +1,8 @@
 use crate::utils::{
-    apply_matrix, enumerate_rec, get_purity_iterator, index_of_state, make_index_deltas,
-    make_unitary,
+    apply_matrix, enumerate_rec, get_purity_iterator, get_trace_rho, index_of_state,
+    make_index_deltas, make_unitary,
 };
+use ndarray::s;
 use num_complex::Complex;
 use numpy::ndarray::{Array1, Array2, Array3, Axis};
 use numpy::{
@@ -246,6 +247,11 @@ impl MultiDefectState {
         Ok(Self { mds })
     }
 
+    /// Get trace of rho
+    fn get_trace_rho(&self) -> f64 {
+        self.mds.details.trace_rho
+    }
+
     /// Apply a single brick layer
     /// `offset`: if true bricks start at [1,2], else [0,1]
     pub fn apply_layer(&mut self, offset: bool) {
@@ -354,6 +360,7 @@ struct StateDetails<const N: usize> {
     index_deltas: Vec<usize>,
     /// `v[i]` is a list of (index with occupation at i, index of defect occupying i).
     occupied_indices: Vec<Vec<(usize, usize)>>,
+    trace_rho: f64,
 }
 
 /// const generic tunes memory usage to optimize for num_defects <= N.
@@ -503,6 +510,8 @@ impl<const N: usize> MultiDefectStateRaw<N> {
                 })
             });
 
+        let trace_rho = get_trace_rho(probs.as_slice().unwrap(), full_state.slice(s![0, .., ..]));
+
         Ok(Self {
             experiment_states: full_state,
             details: StateDetails {
@@ -512,6 +521,7 @@ impl<const N: usize> MultiDefectStateRaw<N> {
                 enumerated_states,
                 index_deltas,
                 occupied_indices,
+                trace_rho,
             },
         })
     }
@@ -600,7 +610,7 @@ impl<const N: usize> MultiDefectStateRaw<N> {
         let hilbert_d = self.details.enumerated_states.len();
         let probs = self.details.probs.as_slice().unwrap();
         let amps = &self.experiment_states;
-        get_purity_iterator(hilbert_d, probs, amps)
+        get_purity_iterator(hilbert_d, probs, amps, self.details.trace_rho)
     }
 }
 

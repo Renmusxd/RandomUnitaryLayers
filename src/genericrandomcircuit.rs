@@ -1,4 +1,4 @@
-use crate::utils::get_purity_iterator;
+use crate::utils::{get_purity_iterator, get_trace_rho};
 use ndarray::{s, ArrayView1};
 use ndarray_linalg::QR;
 use num_complex::Complex;
@@ -33,6 +33,7 @@ pub struct GenericMultiDefectState {
     layer_connections: Option<Vec<(usize, usize)>>,
     connections: Option<PrecomputedConnections>,
     parallel_mats: bool,
+    trace_rho: f64,
 }
 
 struct PrecomputedConnections {
@@ -149,6 +150,8 @@ impl GenericMultiDefectState {
             (1, Array1::ones((1,)), amps)
         };
 
+        let trace_rho = get_trace_rho(probs.as_slice().unwrap(), amplitudes.slice(s![0, .., ..]));
+
         let buffer = amplitudes.clone();
         let mut s = Self {
             l,
@@ -162,6 +165,7 @@ impl GenericMultiDefectState {
             layer_connections,
             connections: None,
             parallel_mats,
+            trace_rho,
         };
 
         let (_, a) = s.get_amplitudes_mut();
@@ -171,6 +175,11 @@ impl GenericMultiDefectState {
             }
         }
         Ok(s)
+    }
+
+    /// Get trace of rho
+    fn get_trace_rho(&self) -> f64 {
+        self.trace_rho
     }
 
     fn get_states(&self, py: Python) -> Py<PyArray3<usize>> {
@@ -603,7 +612,7 @@ impl GenericMultiDefectState {
         let hilbert_d = self.states.as_ref().unwrap().shape()[0];
         let (probs, amps, _) = self.amplitudes.as_ref().unwrap();
         let probs = probs.as_slice().unwrap();
-        get_purity_iterator(hilbert_d, probs, amps)
+        get_purity_iterator(hilbert_d, probs, amps, self.get_trace_rho())
     }
 
     // TODO A pain to debug so skipping for now.

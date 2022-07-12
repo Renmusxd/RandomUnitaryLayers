@@ -13,6 +13,7 @@ pub struct SingleDefectState {
     pub probs: Array1<f64>,
     // Experiments x Mixed states x Hilbert Space
     pub states: Array3<Complex<f64>>,
+    pub trace_rho: f64,
 }
 
 #[pymethods]
@@ -40,7 +41,7 @@ impl SingleDefectState {
                 "Mixed state must contain at least one state",
             ));
         }
-        let probs = state.iter().map(|(w, _)| *w).collect();
+        let probs = state.iter().map(|(w, _)| *w).collect::<Array1<f64>>();
         let states = state
             .iter()
             .try_fold(vec![], |mut acc, (_, s)| -> Result<_, _> {
@@ -66,7 +67,15 @@ impl SingleDefectState {
                     })
             });
         let states = res_states;
-        Ok(Self { d, probs, states })
+
+        let trace_rho = get_trace_rho(probs.as_slice().unwrap(), states.slice(s![0, .., ..]));
+
+        Ok(Self {
+            d,
+            probs,
+            states,
+            trace_rho,
+        })
     }
 
     /// Apply a single brick layer
@@ -187,12 +196,22 @@ impl SingleDefectState {
         self.apply_alternative_layers_and_store_mean_purity(res.iter_mut(), periodic_boundaries);
         Ok(res.into_pyarray(py).to_owned())
     }
+
+    /// Get trace of rho
+    fn get_trace_rho(&self) -> f64 {
+        self.trace_rho
+    }
 }
 
 impl SingleDefectState {
     /// Compute the purity estimator of the state and return as a floating point value.
     pub fn get_purity_iterator(&self) -> impl IndexedParallelIterator<Item = f64> + '_ {
-        get_purity_iterator(self.d, self.probs.as_slice().unwrap(), &self.states)
+        get_purity_iterator(
+            self.d,
+            self.probs.as_slice().unwrap(),
+            &self.states,
+            self.get_trace_rho(),
+        )
     }
 
     /// Compute the purity at each layer of the process and save to a numpy array.

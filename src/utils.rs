@@ -1,6 +1,7 @@
+use ndarray::ArrayView2;
 use num_complex::Complex;
 use num_integer::binomial;
-use numpy::ndarray::{s, Array3, Axis};
+use numpy::ndarray::{Array3, Axis};
 use rand::Rng;
 use rayon::prelude::*;
 use smallvec::SmallVec;
@@ -152,6 +153,20 @@ pub fn make_index_deltas(n_sites: usize, n_defects: usize) -> Vec<usize> {
     index_deltas
 }
 
+/// Get trace rho from probs and amplitudes.
+pub fn get_trace_rho(probs: &[f64], amps: ArrayView2<Complex<f64>>) -> f64 {
+    amps.axis_iter(Axis(0))
+        .into_par_iter()
+        .zip(probs.into_par_iter())
+        .map(|(states, p)| {
+            p * states
+                .into_par_iter()
+                .map(|amp| amp.norm_sqr())
+                .sum::<f64>()
+        })
+        .sum()
+}
+
 /// Compute the purity estimator of the state and return as a floating point value.
 /// Assumes Tr(rho) = 1.0
 /// Calculates D(sum_{s,s'} (-D)^{-delta_{s,s'}} P(s) P(s')
@@ -161,8 +176,10 @@ pub fn get_purity_iterator<'a>(
     hilbert_d: usize,
     probs: &'a [f64],
     amps: &'a Array3<Complex<f64>>,
+    trace_rho: f64,
 ) -> impl IndexedParallelIterator<Item = f64> + 'a {
     // Iterate across experiments
+    let trace_rho_sqr = trace_rho.powi(2);
     amps.axis_iter(Axis(0))
         .into_par_iter()
         .map(move |state| -> f64 {
@@ -180,7 +197,7 @@ pub fn get_purity_iterator<'a>(
                             .powi(2)
                     })
                     .sum::<f64>()
-                - 1.0
+                - trace_rho_sqr
         })
 }
 
