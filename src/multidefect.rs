@@ -2,7 +2,7 @@ use crate::utils::{
     apply_matrix, enumerate_rec, get_purity_iterator, get_trace_rho, index_of_state,
     make_index_deltas, make_unitary,
 };
-use ndarray::s;
+use ndarray::{s, ArrayViewMut1};
 use num_complex::Complex;
 use numpy::ndarray::{Array1, Array2, Array3, Axis};
 use numpy::{
@@ -34,33 +34,47 @@ impl MultiDefectState {
     }
 
     /// Compute the purity at each layer of the process and save to a numpy array.
-    pub fn apply_alternative_layers_and_store_mean_purity_and_density<'a, It, Arr>(
+    pub fn apply_alternative_layers_and_store_mean_purity_and_density<'a, 'b, It>(
         &mut self,
         iterator: It,
     ) where
-        Arr: IndexMut<usize, Output = f64>,
-        It: IntoIterator<Item = (&'a mut f64, Arr)>,
+        // Arr: IntoParallelRefMutIterator<'a, Item = f64>,
+        It: IntoIterator<Item = (&'b mut f64, ArrayViewMut1<'a, f64>)>,
     {
+        self.mds.construct_density_lookup();
+        let density_lookup = self.mds.details.density_hints.take().unwrap();
+
+        iterator.into_iter().enumerate().for_each(|(i, (f, rho))| {
+            self.apply_layer(i % 2 == 1);
+            *f = self.get_mean_purity();
+
+            self.mds.get_mean_density(rho);
+        });
+        self.mds.details.density_hints = Some(density_lookup);
+    }
+
+    /// Compute the purity at each layer of the process and save to a numpy array.
+    pub fn apply_alternative_layers_and_store_mean_purity_and_density_and_variance<'a, 'b, It>(
+        &mut self,
+        iterator: It,
+        sectors: &[(usize, usize)],
+    ) where
+        // Arr: IntoParallelRefMutIterator<'a, Item = f64>,
+        It: IntoIterator<Item = (&'b mut f64, ArrayViewMut1<'a, f64>, ArrayViewMut1<'a, f64>)>,
+    {
+        self.mds.construct_density_lookup();
+        let density_lookup = self.mds.details.density_hints.take().unwrap();
+
         iterator
             .into_iter()
             .enumerate()
-            .for_each(|(i, (f, mut rho))| {
+            .for_each(|(i, (f, rho, var_rho))| {
                 self.apply_layer(i % 2 == 1);
                 *f = self.get_mean_purity();
-
-                let states = &self.mds.details.enumerated_states;
-                let probs = &self.mds.details.probs;
-                let ne = self.mds.experiment_states.shape()[0];
-
-                ndarray::Zip::indexed(&self.mds.experiment_states).for_each(
-                    |(_exp, mix, state), amp| {
-                        let dens = amp.norm_sqr() * probs[mix] / (ne as f64);
-                        states[state].iter().copied().for_each(|defect_index| {
-                            rho[defect_index] += dens;
-                        })
-                    },
-                );
+                self.mds
+                    .get_sector_density_and_variance(sectors, rho, var_rho);
             });
+        self.mds.details.density_hints = Some(density_lookup);
     }
 }
 
@@ -266,6 +280,13 @@ impl MultiDefectState {
         }
     }
 
+    /// Get density of defects by site.
+    pub fn get_density(&mut self, py: Python) -> Py<PyArray1<f64>> {
+        let mut rho = Array1::zeros((self.mds.details.num_sites,));
+        self.mds.get_mean_density(rho.view_mut());
+        rho.into_pyarray(py).to_owned()
+    }
+
     /// Get the state of the system.
     pub fn get_state(&self, py: Python) -> (Py<PyArray1<f64>>, Py<PyArray3<Complex64>>) {
         let probs = self.mds.details.probs.to_pyarray(py).to_owned();
@@ -349,6 +370,49 @@ impl MultiDefectState {
             dens.into_pyarray(py).to_owned(),
         ))
     }
+
+    /// Compute the purity and density at each of `n_layers` and save to a numpy array.
+    /// Requires a list of sectors in which to calculate density and variances
+    /// `sectors`: list of (start, end) - inclusive start and exclusive end.
+    pub fn apply_alternative_layers_and_save_mean_purity_and_density_and_variances(
+        &mut self,
+        py: Python,
+        n_layers: usize,
+        sectors: Vec<(usize, usize)>,
+    ) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+        let mut res = Array1::zeros((n_layers,));
+        let mut dens = Array2::zeros((n_layers, sectors.len()));
+        let mut vars = Array2::zeros((n_layers, sectors.len()));
+        let iter = res
+            .iter_mut()
+            .zip(dens.axis_iter_mut(Axis(0)))
+            .zip(vars.axis_iter_mut(Axis(0)))
+            .map(|((i, a), b)| (i, a, b));
+        self.apply_alternative_layers_and_store_mean_purity_and_density_and_variance(
+            iter, &sectors,
+        );
+        Ok((
+            res.into_pyarray(py).to_owned(),
+            dens.into_pyarray(py).to_owned(),
+            vars.into_pyarray(py).to_owned(),
+        ))
+    }
+
+    /// Get the density and variance for the sectors.
+    pub fn get_sector_densities_and_variance(
+        &mut self,
+        py: Python,
+        sectors: Vec<(usize, usize)>,
+    ) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>)> {
+        let mut dens = Array1::zeros((sectors.len(),));
+        let mut vars = Array1::zeros((sectors.len(),));
+        self.mds
+            .get_sector_density_and_variance(&sectors, dens.view_mut(), vars.view_mut());
+        Ok((
+            dens.into_pyarray(py).to_owned(),
+            vars.into_pyarray(py).to_owned(),
+        ))
+    }
 }
 
 struct StateDetails<const N: usize> {
@@ -361,6 +425,7 @@ struct StateDetails<const N: usize> {
     /// `v[i]` is a list of (index with occupation at i, index of defect occupying i).
     occupied_indices: Vec<Vec<(usize, usize)>>,
     trace_rho: f64,
+    density_hints: Option<Vec<Vec<usize>>>,
 }
 
 /// const generic tunes memory usage to optimize for num_defects <= N.
@@ -384,6 +449,160 @@ impl<const N: usize> MultiDefectStateRaw<N> {
             num_experiments,
             skip_float_checks,
         )
+    }
+
+    pub fn get_mean_density(&mut self, mut rho: ArrayViewMut1<f64>) {
+        self.construct_density_lookup();
+        let density_lookup = self.details.density_hints.take().unwrap();
+
+        let probs = &self.details.probs;
+        let ne = self.experiment_states.shape()[0];
+
+        rho.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(site, mut rho)| {
+                let rho = rho.get_mut([]).unwrap();
+                *rho = density_lookup[site]
+                    .iter()
+                    .copied()
+                    .map(|state_index| {
+                        let experiments_and_mixtures =
+                            self.experiment_states.slice(s![.., .., state_index]);
+                        experiments_and_mixtures
+                            .axis_iter(Axis(1))
+                            .into_par_iter()
+                            .zip(probs.axis_iter(Axis(0)).into_par_iter())
+                            .map(|(states, prob)| {
+                                prob.get([]).unwrap()
+                                    * states.iter().map(|amp| amp.norm_sqr()).sum::<f64>()
+                            })
+                            .sum::<f64>()
+                    })
+                    .sum::<f64>()
+                    / (ne as f64)
+            });
+        self.details.density_hints = Some(density_lookup);
+    }
+
+    // TODO: test code
+    // pub fn get_density_per_experiment(&mut self, mut rho: ArrayViewMut2<f64>) {
+    //     self.construct_density_lookup();
+    //     let density_lookup = self.details.density_hints.take().unwrap();
+    //
+    //     let states = &self.experiment_states;
+    //     let probs = &self.details.probs;
+    //     ndarray::Zip::indexed(&mut rho)
+    //         .into_par_iter()
+    //         .for_each(|((exp, site), rho)| {
+    //             let exp_states = states.index_axis(Axis(0), exp);
+    //             *rho = probs
+    //                 .iter()
+    //                 .zip(exp_states.axis_iter(Axis(0)))
+    //                 .map(|(p, ss)| {
+    //                     *p * density_lookup[site]
+    //                         .iter()
+    //                         .copied()
+    //                         .map(|state| ss[[state]].norm_sqr())
+    //                         .sum::<f64>()
+    //                 })
+    //                 .sum::<f64>();
+    //         });
+    //
+    //     self.details.density_hints = Some(density_lookup);
+    // }
+
+    pub fn get_sector_density_and_variance(
+        &mut self,
+        sectors: &[(usize, usize)],
+        mut rho: ArrayViewMut1<f64>,
+        mut var_rho: ArrayViewMut1<f64>,
+    ) {
+        self.construct_density_lookup();
+        let density_lookup = self.details.density_hints.take().unwrap();
+        let states = &self.experiment_states;
+        let probs = &self.details.probs;
+        let enumerated_states = &self.details.enumerated_states;
+        let ne = states.shape()[0];
+
+        rho.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(var_rho.axis_iter_mut(Axis(0)).into_par_iter())
+            .zip(sectors.into_par_iter().copied())
+            .for_each(|((mut rho, mut var_rho), (start, end))| {
+                let (res_rho, res_var) = states
+                    .axis_iter(Axis(0))
+                    .into_par_iter()
+                    .map(|exp_states| {
+                        let exp_rho = (start..end)
+                            .map(|site| {
+                                probs
+                                    .iter()
+                                    .zip(exp_states.axis_iter(Axis(0)))
+                                    .map(|(p, ss)| {
+                                        *p * density_lookup[site]
+                                            .iter()
+                                            .copied()
+                                            .map(|state| ss[[state]].norm_sqr())
+                                            .sum::<f64>()
+                                    })
+                                    .sum::<f64>()
+                            })
+                            .sum::<f64>();
+                        let exp_var = exp_states
+                            .axis_iter(Axis(0))
+                            .zip(probs.iter().copied())
+                            .map(|(states_for_mixture, prob)| {
+                                prob * states_for_mixture
+                                    .axis_iter(Axis(0))
+                                    .zip(enumerated_states.iter())
+                                    .map(|(amp, state)| {
+                                        let in_region = state
+                                            .iter()
+                                            .cloned()
+                                            .filter(|index| (*index >= start) && (*index < end))
+                                            .count();
+                                        amp.get([]).unwrap().norm_sqr()
+                                            * ((in_region as f64) - exp_rho).powi(2)
+                                    })
+                                    .sum::<f64>()
+                            })
+                            .sum::<f64>();
+                        (exp_rho, exp_var)
+                    })
+                    .reduce(
+                        || (0., 0.),
+                        |(arho, avar), (brho, bvar)| (arho + brho, avar + bvar),
+                    );
+                *rho.get_mut([]).unwrap() = res_rho / (ne as f64);
+                *var_rho.get_mut([]).unwrap() = res_var / (ne as f64);
+            });
+
+        self.details.density_hints = Some(density_lookup);
+    }
+
+    /// Make a lookup table from site -> list of states.
+    /// Speeds up density calculations.
+    fn construct_density_lookup(&mut self) {
+        if self.details.density_hints.is_none() {
+            let mut v: Vec<Vec<usize>> = vec![vec![]; self.details.num_sites];
+            v.iter_mut().enumerate().for_each(|(site, v)| {
+                v.extend(
+                    self.details
+                        .enumerated_states
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(s_index, s_state)| {
+                            if s_state.contains(&site) {
+                                Some(s_index)
+                            } else {
+                                None
+                            }
+                        }),
+                );
+            });
+            self.details.density_hints = Some(v)
+        }
     }
 
     fn check_input(
@@ -522,6 +741,7 @@ impl<const N: usize> MultiDefectStateRaw<N> {
                 index_deltas,
                 occupied_indices,
                 trace_rho,
+                density_hints: None,
             },
         })
     }
