@@ -14,6 +14,7 @@ use pyo3::prelude::*;
 fn py_entropy(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<SingleDefectState>()?;
     m.add_class::<MultiDefectState>()?;
+    m.add_class::<MultidefectPureState>()?;
     #[cfg(feature = "internaldof")]
     m.add_class::<GenericMultiDefectState>()?;
     Ok(())

@@ -4,6 +4,7 @@ use crate::utils::{
 };
 use ndarray::{s, ArrayViewMut1};
 use num_complex::Complex;
+use num_traits::Zero;
 use numpy::ndarray::{Array1, Array2, Array3, Axis};
 use numpy::{
     Complex64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
@@ -15,6 +16,121 @@ use rand::Rng;
 use rayon::prelude::*;
 use smallvec::{smallvec, SmallVec};
 use std::ops::IndexMut;
+
+#[pyclass]
+#[derive(Clone)]
+pub struct MultidefectPureState {
+    indices: Array2<usize>,
+    amplitudes: Array1<Complex<f64>>,
+}
+
+#[pymethods]
+impl MultidefectPureState {
+    #[new]
+    pub fn new(
+        indices: PyReadonlyArray2<usize>,
+        amplitudes: PyReadonlyArray1<Complex64>,
+    ) -> PyResult<Self> {
+        let total_prob = amplitudes
+            .as_slice()
+            .map_err(PyValueError::new_err)?
+            .iter()
+            .map(|a| a.norm_sqr())
+            .sum::<f64>();
+        if (total_prob - 1.0).abs() > 100. * f64::EPSILON {
+            return Err(PyValueError::new_err(
+                "Total amplitude squared must sum to 1.0",
+            ));
+        }
+        Ok(Self {
+            indices: indices.to_owned_array(),
+            amplitudes: amplitudes.to_owned_array(),
+        })
+    }
+
+    pub fn num_defects(&self) -> usize {
+        self.indices.shape()[1]
+    }
+
+    pub fn non_zero_indices(&self) -> Vec<Vec<usize>> {
+        self.indices
+            .axis_iter(Axis(0))
+            .zip(self.amplitudes.iter().copied())
+            .filter_map(|(ss, amp)| {
+                if amp.norm_sqr() > f64::EPSILON {
+                    Some(ss.iter().copied().collect::<Vec<_>>())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn trace_out_site(
+        &self,
+        site: usize,
+    ) -> ((f64, MultidefectPureState), (f64, MultidefectPureState)) {
+        let prob_with_defect = self
+            .indices
+            .axis_iter(Axis(0))
+            .zip(self.amplitudes.iter())
+            .filter_map(|(state, amp)| {
+                if state.iter().copied().find(|i| i.eq(&site)).is_some() {
+                    Some(amp.norm_sqr())
+                } else {
+                    None
+                }
+            })
+            .sum::<f64>();
+        let prob_without_defect = 1.0 - prob_with_defect;
+
+        let mut with_defect_amps = self.amplitudes.clone();
+        let mut without_defect_amps = self.amplitudes.clone();
+        self.indices
+            .axis_iter(Axis(0))
+            .zip(
+                with_defect_amps
+                    .iter_mut()
+                    .zip(without_defect_amps.iter_mut()),
+            )
+            .for_each(|(state, (amp_with, amp_without))| {
+                if state.iter().copied().find(|i| i.eq(&site)).is_some() {
+                    *amp_with /= prob_with_defect.sqrt();
+                    *amp_without = Complex::zero();
+                } else {
+                    *amp_without /= prob_without_defect.sqrt();
+                    *amp_with = Complex::zero();
+                }
+            });
+        if prob_with_defect.abs() < f64::EPSILON {
+            with_defect_amps
+                .iter_mut()
+                .for_each(|amp| *amp = Complex::zero());
+        }
+        if prob_without_defect.abs() < f64::EPSILON {
+            without_defect_amps
+                .iter_mut()
+                .for_each(|amp| *amp = Complex::zero());
+        }
+
+        (
+            (
+                prob_with_defect,
+                Self {
+                    amplitudes: with_defect_amps,
+                    indices: self.indices.clone(),
+                },
+            ),
+            (
+                prob_without_defect,
+                Self {
+                    amplitudes: without_defect_amps,
+                    indices: self.indices.clone(),
+                },
+            ),
+        )
+    }
+}
 
 #[pyclass]
 pub struct MultiDefectState {
@@ -81,17 +197,14 @@ impl MultiDefectState {
 #[pymethods]
 impl MultiDefectState {
     /// Construct a state with multiple defects
-    /// `indices`: list of occupation strings (represented as lists of indices of length n_defects).
-    /// `amplitudes`: numpy array of amplitudes, one per occupation string.
+    /// `state`: PureState
     /// `n_sites`: number of sites on lattice.
-    /// `n_defects`: number of defects in system.
     /// `num_experiments`: number of independent experiments to run.
     #[new]
     fn new(
         indices: Vec<Vec<usize>>,
         amplitudes: PyReadonlyArray1<Complex64>,
         n_sites: usize,
-        n_defects: usize,
         num_experiments: Option<usize>,
         skip_float_checks: Option<bool>,
     ) -> PyResult<Self> {
@@ -102,6 +215,15 @@ impl MultiDefectState {
                 amplitudes.shape()[0]
             )));
         }
+
+        let mut sizes = indices.iter().map(|is| is.len()).collect::<Vec<_>>();
+        sizes.dedup();
+        if sizes.len() != 1 {
+            return Err(PyValueError::new_err(
+                "All states must be in same number sector.",
+            ));
+        }
+        let n_defects = sizes[0];
 
         let state = indices
             .into_iter()
@@ -120,47 +242,39 @@ impl MultiDefectState {
     }
 
     /// Construct a state with multiple defects
-    /// `indices`: numpy array of occupations (represented as array of indices of length n_defects).
-    /// `amplitudes`: numpy array of amplitudes, one per occupation string.
+    /// `state`: PureState
     /// `n_sites`: number of sites on lattice.
-    /// `n_defects`: number of defects in system.
     /// `num_experiments`: number of independent experiments to run.
     #[staticmethod]
     fn new_pure(
-        indices: PyReadonlyArray2<usize>,
-        amplitudes: PyReadonlyArray1<Complex64>,
+        state: MultidefectPureState,
         n_sites: usize,
-        n_defects: usize,
         num_experiments: Option<usize>,
         skip_float_checks: Option<bool>,
     ) -> PyResult<Self> {
-        if let ([indices_num_states, indices_num_defects], [amplitudes_num_states]) =
-            (indices.shape(), amplitudes.shape())
-        {
-            if *indices_num_defects != n_defects {
+        let (indices, amplitudes) = (state.indices, state.amplitudes);
+        let n_defects =
+            if let ([indices_num_states, indices_num_defects], [amplitudes_num_states]) =
+                (indices.shape(), amplitudes.shape())
+            {
+                if amplitudes_num_states != indices_num_states {
+                    return Err(PyValueError::new_err(format!(
+                        "Expected {} state amplitudes, found {}",
+                        indices_num_states, amplitudes_num_states
+                    )));
+                }
+                *indices_num_defects
+            } else {
                 return Err(PyValueError::new_err(format!(
-                    "Expected {} defects, found indices for {}",
-                    n_defects, indices_num_defects
+                    "Invalid array shapes ({},{}) expecting (2,1)",
+                    indices.shape().len(),
+                    amplitudes.shape().len()
                 )));
-            }
-            if amplitudes_num_states != indices_num_states {
-                return Err(PyValueError::new_err(format!(
-                    "Expected {} state amplitudes, found {}",
-                    indices_num_states, amplitudes_num_states
-                )));
-            }
-        } else {
-            return Err(PyValueError::new_err(format!(
-                "Invalid array shapes ({},{}) expecting (2,1)",
-                indices.shape().len(),
-                amplitudes.shape().len()
-            )));
-        }
+            };
 
         let state = indices
-            .to_owned_array()
             .axis_iter(Axis(0))
-            .zip(amplitudes.to_owned_array().into_iter())
+            .zip(amplitudes.into_iter())
             .map(|(indx, c)| {
                 (
                     indx.into_iter().cloned().collect(),
@@ -169,6 +283,55 @@ impl MultiDefectState {
             })
             .collect();
         let mds = MultiDefectStateRaw::<8>::new_pure(
+            state,
+            n_sites,
+            n_defects,
+            num_experiments,
+            skip_float_checks,
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(Self { mds })
+    }
+
+    /// Construct a state with multiple defects
+    /// `details`: List of (probability, PureState)
+    /// `n_sites`: number of sites on lattice.
+    /// `n_defects`: number of defects in system.
+    /// `num_experiments`: number of independent experiments to run.
+    #[staticmethod]
+    fn new_mixed_from_states(
+        states: Vec<(f64, MultidefectPureState)>,
+        n_sites: usize,
+        num_experiments: Option<usize>,
+        skip_float_checks: Option<bool>,
+    ) -> PyResult<Self> {
+        let mut defect_nums = states
+            .iter()
+            .map(|(_, s)| s.num_defects())
+            .collect::<Vec<_>>();
+        defect_nums.dedup();
+        if defect_nums.len() != 1 {
+            return Err(PyValueError::new_err(
+                "All pure states must be in same number sector",
+            ));
+        }
+        let n_defects = defect_nums[0];
+
+        let state = states
+            .into_iter()
+            .map(|(p, s)| {
+                (
+                    p,
+                    s.indices
+                        .axis_iter(Axis(0))
+                        .zip(s.amplitudes.into_iter())
+                        .map(|(indices, amplitude)| (indices.to_vec(), amplitude))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let mds = MultiDefectStateRaw::<8>::new_mixed(
             state,
             n_sites,
             n_defects,
