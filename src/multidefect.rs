@@ -1,6 +1,6 @@
 use crate::utils::{
     apply_matrix, enumerate_rec, get_purity_iterator, get_trace_rho, index_of_state,
-    make_index_deltas, make_unitary,
+    make_aa_bb_matrix, make_index_deltas, make_unitary, split_num_by_indices,
 };
 use ndarray::{s, ArrayViewMut1};
 use num_complex::Complex;
@@ -15,6 +15,7 @@ use pyo3::prelude::*;
 use rand::Rng;
 use rayon::prelude::*;
 use smallvec::{smallvec, SmallVec};
+use std::collections::HashSet;
 use std::ops::IndexMut;
 
 #[pyclass]
@@ -75,7 +76,7 @@ impl MultidefectPureState {
             .axis_iter(Axis(0))
             .zip(self.amplitudes.iter())
             .filter_map(|(state, amp)| {
-                if state.iter().copied().find(|i| i.eq(&site)).is_some() {
+                if state.iter().copied().any(|i| i.eq(&site)) {
                     Some(amp.norm_sqr())
                 } else {
                     None
@@ -94,7 +95,7 @@ impl MultidefectPureState {
                     .zip(without_defect_amps.iter_mut()),
             )
             .for_each(|(state, (amp_with, amp_without))| {
-                if state.iter().copied().find(|i| i.eq(&site)).is_some() {
+                if state.iter().copied().any(|i| i.eq(&site)) {
                     *amp_with /= prob_with_defect.sqrt();
                     *amp_without = Complex::zero();
                 } else {
@@ -154,7 +155,6 @@ impl MultiDefectState {
         &mut self,
         iterator: It,
     ) where
-        // Arr: IntoParallelRefMutIterator<'a, Item = f64>,
         It: IntoIterator<Item = (&'b mut f64, ArrayViewMut1<'a, f64>)>,
     {
         self.mds.construct_density_lookup();
@@ -170,12 +170,32 @@ impl MultiDefectState {
     }
 
     /// Compute the purity at each layer of the process and save to a numpy array.
+    /// Also compute the purity from tracing out the chosen sites.
+    pub fn apply_alternative_layers_and_store_mean_purity_and_trace_purity<'a, 'b, It>(
+        &mut self,
+        iterator: It,
+        trace_sites: &[usize],
+    ) where
+        It: IntoIterator<Item = (&'a mut f64, &'b mut f64)>,
+    {
+        // Tracing out k sites of a total L with M defects.
+        // Cheat and use a hashmap
+        // sum Px Py cxi cxj* cyk cyl* [Ai=Aj][Bj=Bk][Ak=Al][Bl=Bi]
+        let aa_bb = self.mds.get_aa_bb_matrix(trace_sites);
+
+        iterator.into_iter().enumerate().for_each(|(i, (f, tf))| {
+            self.apply_layer(i % 2 == 1);
+            *f = self.get_mean_purity();
+            *tf = self.mds.get_substate_purity(&aa_bb);
+        });
+    }
+
+    /// Compute the purity at each layer of the process and save to a numpy array.
     pub fn apply_alternative_layers_and_store_mean_purity_and_density_and_variance<'a, 'b, It>(
         &mut self,
         iterator: It,
         sectors: &[(usize, usize)],
     ) where
-        // Arr: IntoParallelRefMutIterator<'a, Item = f64>,
         It: IntoIterator<Item = (&'b mut f64, ArrayViewMut1<'a, f64>, ArrayViewMut1<'a, f64>)>,
     {
         self.mds.construct_density_lookup();
@@ -561,6 +581,23 @@ impl MultiDefectState {
         ))
     }
 
+    /// Compute the purity and density at each of `n_layers` and save to a numpy array.
+    pub fn apply_alternative_layers_and_save_mean_purity_and_trace_purity(
+        &mut self,
+        py: Python,
+        n_layers: usize,
+        sites: Vec<usize>,
+    ) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>)> {
+        let mut res = Array1::zeros((n_layers,));
+        let mut half_res = Array1::zeros((n_layers,));
+        let iter = res.iter_mut().zip(half_res.iter_mut());
+        self.apply_alternative_layers_and_store_mean_purity_and_trace_purity(iter, &sites);
+        Ok((
+            res.into_pyarray(py).to_owned(),
+            half_res.into_pyarray(py).to_owned(),
+        ))
+    }
+
     /// Get the density and variance for the sectors.
     pub fn get_sector_densities_and_variance(
         &mut self,
@@ -575,6 +612,11 @@ impl MultiDefectState {
             dens.into_pyarray(py).to_owned(),
             vars.into_pyarray(py).to_owned(),
         ))
+    }
+
+    pub fn get_trace_purity(&mut self, trace_sites: Vec<usize>) -> f64 {
+        let aa_bb = self.mds.get_aa_bb_matrix(&trace_sites);
+        self.mds.get_substate_purity(&aa_bb)
     }
 }
 
@@ -648,32 +690,57 @@ impl<const N: usize> MultiDefectStateRaw<N> {
         self.details.density_hints = Some(density_lookup);
     }
 
-    // TODO: test code
-    // pub fn get_density_per_experiment(&mut self, mut rho: ArrayViewMut2<f64>) {
-    //     self.construct_density_lookup();
-    //     let density_lookup = self.details.density_hints.take().unwrap();
-    //
-    //     let states = &self.experiment_states;
-    //     let probs = &self.details.probs;
-    //     ndarray::Zip::indexed(&mut rho)
-    //         .into_par_iter()
-    //         .for_each(|((exp, site), rho)| {
-    //             let exp_states = states.index_axis(Axis(0), exp);
-    //             *rho = probs
-    //                 .iter()
-    //                 .zip(exp_states.axis_iter(Axis(0)))
-    //                 .map(|(p, ss)| {
-    //                     *p * density_lookup[site]
-    //                         .iter()
-    //                         .copied()
-    //                         .map(|state| ss[[state]].norm_sqr())
-    //                         .sum::<f64>()
-    //                 })
-    //                 .sum::<f64>();
-    //         });
-    //
-    //     self.details.density_hints = Some(density_lookup);
-    // }
+    fn get_substate_purity(&mut self, aa_bb: &HashSet<(usize, usize, usize, usize)>) -> f64 {
+        self.experiment_states
+            .axis_iter(Axis(0))
+            .into_par_iter()
+            .map(|amplitudes| {
+                let mut sum = 0.0;
+                for x in 0..self.details.probs.len() {
+                    let probx = self.details.probs[x];
+                    let coeffx = amplitudes.index_axis(Axis(0), x);
+                    for y in 0..self.details.probs.len() {
+                        let proby = self.details.probs[y];
+                        let coeffy = amplitudes.index_axis(Axis(0), y);
+
+                        let mut subsum = 0.0;
+                        for (i, j, k, l) in aa_bb.iter().copied() {
+                            let complex =
+                                coeffx[i] * coeffx[j].conj() * coeffy[k] * coeffy[l].conj();
+                            subsum += complex.re;
+                        }
+                        sum += probx * proby * subsum;
+                    }
+                }
+                sum
+            })
+            .sum::<f64>()
+            / (self.experiment_states.shape()[0] as f64)
+    }
+
+    pub fn get_aa_bb_matrix(
+        &mut self,
+        trace_sites: &[usize],
+    ) -> HashSet<(usize, usize, usize, usize)> {
+        let mut sorted_trace = trace_sites.to_vec();
+        sorted_trace.sort_unstable();
+
+        let ingroup_outgroup = self
+            .details
+            .enumerated_states
+            .par_iter()
+            .map(|state| {
+                let mut num = 0usize;
+                for s in state {
+                    num |= 1 << s;
+                }
+                num
+            })
+            .map(|num| split_num_by_indices(num, &sorted_trace, self.details.num_sites))
+            .collect::<Vec<_>>();
+
+        make_aa_bb_matrix(&ingroup_outgroup)
+    }
 
     pub fn get_sector_density_and_variance(
         &mut self,

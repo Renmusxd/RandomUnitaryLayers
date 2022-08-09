@@ -6,6 +6,9 @@ use rand::Rng;
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Debug;
+use std::hash::Hash;
 use std::ops::{Add, Mul};
 
 /// Calculates SUM in O(N) from an iterator of [t_n,...,t_0]
@@ -201,6 +204,83 @@ pub fn get_purity_iterator<'a>(
         })
 }
 
+/// Split bits into in group and out group.
+pub fn split_num_by_indices(
+    num: usize,
+    sorted_indices: &[usize],
+    num_sites: usize,
+) -> (usize, usize) {
+    let mut in_group = 0usize;
+    let mut out_group = 0usize;
+
+    let mut j = 0;
+    for i in 0..num_sites {
+        if j < sorted_indices.len() && i == sorted_indices[j] {
+            j += 1;
+            in_group <<= 1;
+            in_group |= (num >> i) & 1;
+        } else {
+            out_group <<= 1;
+            out_group |= (num >> i) & 1;
+        }
+    }
+    (in_group, out_group)
+}
+
+pub fn make_aa_bb_matrix<A, B>(ingroup_outgroup: &[(A, B)]) -> HashSet<(usize, usize, usize, usize)>
+where
+    A: Copy + Eq + Hash + Debug,
+    B: Copy + Eq + Hash + Debug,
+{
+    // Lists of state indices which share the same in or out groups.
+    let mut ingroup_lookup = HashMap::new();
+    let mut outgroup_lookup = HashMap::new();
+
+    ingroup_outgroup
+        .iter()
+        .cloned()
+        .enumerate()
+        .for_each(|(si, (ing, outg))| {
+            ingroup_lookup
+                .entry(ing)
+                .or_insert_with(Vec::default)
+                .push(si);
+            outgroup_lookup
+                .entry(outg)
+                .or_insert_with(Vec::default)
+                .push(si);
+        });
+
+    // Nonzero entries in matrix [Ai=Aj][Ak=Al][Bi=Bl][Bj=Bk]
+    let mut aa_bb_matrix = HashSet::new();
+    for i in 0..ingroup_outgroup.len() {
+        let (i_ing, i_outg) = ingroup_outgroup[i];
+
+        let i_same_ingroup = &ingroup_lookup[&i_ing];
+        for j in i_same_ingroup.iter().copied() {
+            let (j_ing, j_outg) = ingroup_outgroup[j];
+            assert_eq!(j_ing, i_ing);
+
+            let j_same_outgroup = &outgroup_lookup[&j_outg];
+            for k in j_same_outgroup.iter().copied() {
+                let (k_ing, k_outg) = ingroup_outgroup[k];
+                assert_eq!(j_outg, k_outg);
+
+                let k_same_ingroup = &ingroup_lookup[&k_ing];
+                for l in k_same_ingroup.iter().copied() {
+                    let (l_ing, l_outg) = ingroup_outgroup[l];
+                    assert_eq!(l_ing, k_ing);
+
+                    if l_outg == i_outg {
+                        aa_bb_matrix.insert((i, j, k, l));
+                    }
+                }
+            }
+        }
+    }
+    aa_bb_matrix
+}
+
 #[cfg(test)]
 mod util_tests {
     use super::*;
@@ -290,6 +370,49 @@ mod util_tests {
                 let delta = deltas[state[i] * n_defects + i];
                 assert_eq!(new_state.as_slice(), states[index + delta].as_slice());
             }
+        }
+    }
+
+    #[test]
+    fn test_split_num() {
+        let num_to_split = 0b010101;
+        let (a, b) = split_num_by_indices(num_to_split, &[0, 2, 4], 6);
+        assert_eq!(a, 0b111);
+        assert_eq!(b, 0b000);
+
+        let num_to_split = 0b010101;
+        let (a, b) = split_num_by_indices(num_to_split, &[0, 2], 6);
+        assert_eq!(a, 0b11);
+        assert_eq!(b, 0b0010);
+
+        let num_to_split = 0b111011;
+        let (a, b) = split_num_by_indices(num_to_split, &[0, 1, 3, 4, 5], 6);
+        assert_eq!(a, 0b11111);
+        assert_eq!(b, 0b0);
+    }
+
+    #[test]
+    fn make_aa_bb_matrix_nosim_test() {
+        let no_sim_ingroup_outgroup = [(0, 1), (1, 2), (2, 3), (3, 4)];
+        let aa_bb = make_aa_bb_matrix(&no_sim_ingroup_outgroup);
+        assert_eq!(aa_bb.len(), 4);
+        for (i, j, k, l) in aa_bb {
+            assert_eq!(i, j);
+            assert_eq!(j, k);
+            assert_eq!(k, l);
+        }
+    }
+
+    #[test]
+    fn make_aa_bb_matrix_sim_test() {
+        let io = [(0, 0), (0, 1), (2, 1), (2, 0)];
+        let aa_bb = make_aa_bb_matrix(&io);
+        println!("{:?}", aa_bb);
+        for (i, j, k, l) in aa_bb {
+            assert_eq!(io[i].0, io[j].0);
+            assert_eq!(io[j].1, io[k].1);
+            assert_eq!(io[k].0, io[l].0);
+            assert_eq!(io[l].1, io[i].1);
         }
     }
 }
