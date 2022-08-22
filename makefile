@@ -1,5 +1,5 @@
 wheel:
-	maturin build --release --strip --no-sdist
+	maturin build --release --strip
 
 .PHONY: clean
 clean:
