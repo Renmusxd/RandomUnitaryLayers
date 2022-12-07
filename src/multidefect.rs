@@ -1050,11 +1050,13 @@ impl<const N: usize> MultiDefectStateRaw<N> {
     }
 
     pub fn enumerate_states(sites: usize, defects: usize) -> Vec<SmallVec<[usize; N]>> {
-        let mut states = vec![];
         if defects > 0 {
+            let mut states = vec![];
             enumerate_rec(&mut states, smallvec![], defects - 1, 0, sites);
+            states
+        } else {
+            vec![smallvec![]]
         }
-        states
     }
 
     /// Compute the purity estimator of the state and return as a floating point value.
