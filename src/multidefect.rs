@@ -1051,7 +1051,7 @@ impl<const N: usize> MultiDefectStateRaw<N> {
 
     pub fn enumerate_states(sites: usize, defects: usize) -> Vec<SmallVec<[usize; N]>> {
         let mut states = vec![];
-        if defects >= 0 {
+        if defects > 0 {
             enumerate_rec(&mut states, smallvec![], defects - 1, 0, sites);
         }
         states
