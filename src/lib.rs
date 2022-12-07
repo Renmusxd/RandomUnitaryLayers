@@ -1,7 +1,7 @@
 #[cfg(feature = "internaldof")]
-mod genericrandomcircuit;
-mod multidefect;
-mod singledefect;
+pub mod genericrandomcircuit;
+pub mod multidefect;
+pub mod singledefect;
 pub mod utils;
 
 #[cfg(feature = "internaldof")]
