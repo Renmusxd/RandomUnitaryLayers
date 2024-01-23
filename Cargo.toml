@@ -44,5 +44,5 @@ optional = true
 
 [dependencies.ndarray-linalg]
 version = ">=0.16"
-features = ["openblas-system"]
+features = ["openblas-static"]
 optional = true
