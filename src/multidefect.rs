@@ -2,13 +2,13 @@ use crate::utils::{
     apply_matrix, enumerate_rec, get_purity_iterator, get_trace_rho, index_of_state,
     make_aa_bb_matrix, make_index_deltas, make_unitary, split_num_by_indices,
 };
-use ndarray::{s, ArrayViewMut1};
+use ndarray::{s, Array4, ArrayViewMut1};
 use num_complex::Complex;
-use num_traits::Zero;
+use num_traits::{One, Zero};
 use numpy::ndarray::{Array1, Array2, Array3, Axis};
 use numpy::{
-    Complex64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
-    PyReadonlyArray3, ToPyArray,
+    Complex64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyReadonlyArray1,
+    PyReadonlyArray2, PyReadonlyArray3, ToPyArray,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -460,6 +460,120 @@ impl MultiDefectState {
         for i in 0..n_layers {
             // Layers alternate between offset and not-offset.
             self.apply_layer(i % 2 == 1);
+        }
+    }
+
+    /// Apply `n_layers` of alternating brick layers, saving state probabilities and matrices.
+    pub fn apply_alternative_layers_and_get_matrices_and_probs(
+        &mut self,
+        py: Python,
+        n_layers: usize,
+        skip_mat_apply: Option<bool>,
+    ) -> (
+        Py<PyArray3<f64>>,
+        Option<(Py<PyArray4<usize>>, Py<PyArray4<Complex64>>)>,
+    ) {
+        let ne = self.mds.experiment_states.shape()[0];
+        let mat_apply = !skip_mat_apply.unwrap_or(false);
+        let mut result_probs =
+            Array3::<f64>::zeros((ne, n_layers, self.mds.details.enumerated_states.len()));
+
+        let mut all_mats = vec![];
+        for i in 0..n_layers {
+            // Layers alternate between offset and not-offset.
+            let mut mats = vec![vec![]; ne];
+            if mat_apply {
+                self.mds
+                    .apply_brick_layer_and_get_matrices(i % 2 == 1, false, &mut mats);
+                all_mats.push(mats)
+            }
+            let probs = &self.mds.details.probs;
+            let states = &self.mds.experiment_states;
+            // Iterate over experiments
+            states
+                .axis_iter(Axis(0))
+                .into_par_iter()
+                .zip(
+                    result_probs
+                        .slice_mut(s![.., i, ..])
+                        .axis_iter_mut(Axis(0))
+                        .into_par_iter(),
+                )
+                .for_each(|(states, mut output_probs)| {
+                    // Iterate over states |s>
+                    states
+                        .axis_iter(Axis(1))
+                        .zip(output_probs.iter_mut())
+                        .for_each(|(mixed_c, output_p)| {
+                            *output_p = mixed_c
+                                .iter()
+                                .zip(probs.iter())
+                                .map(|(c, p)| c.norm_sqr() * p)
+                                .sum::<f64>();
+                        })
+                });
+        }
+        let py_probs = result_probs.into_pyarray(py).to_owned();
+        if mat_apply {
+            let mats_per_layer = all_mats
+                .iter()
+                .flat_map(|x| x.iter())
+                .map(|x| x.len())
+                .max()
+                .unwrap_or_default();
+            let mut indices = Array4::<usize>::zeros((ne, all_mats.len(), mats_per_layer, 2));
+            let mut matrices =
+                Array4::<Complex<f64>>::zeros((ne, all_mats.len(), mats_per_layer, 16));
+            // First iterator over layers
+            all_mats
+                .into_par_iter()
+                .zip(
+                    indices
+                        .axis_iter_mut(Axis(1))
+                        .into_par_iter()
+                        .zip(matrices.axis_iter_mut(Axis(1)).into_par_iter()),
+                )
+                .for_each(|(a_layer_mat, (mut indices, mut matrices))| {
+                    // Now iterate over experiments
+                    a_layer_mat
+                        .iter()
+                        .zip(
+                            indices
+                                .axis_iter_mut(Axis(0))
+                                .zip(matrices.axis_iter_mut(Axis(0))),
+                        )
+                        .for_each(|(experiment_mat, (mut indices, mut matrices))| {
+                            experiment_mat
+                                .iter()
+                                .zip(
+                                    indices
+                                        .axis_iter_mut(Axis(0))
+                                        .zip(matrices.axis_iter_mut(Axis(0))),
+                                )
+                                .for_each(
+                                    |(
+                                        ((a, b), single_central_mat, double_occ_phase),
+                                        (mut index, mut matrix),
+                                    )| {
+                                        // Copy over the indices.
+                                        index[0] = *a;
+                                        index[1] = *b;
+                                        // Copy over the matrix.
+                                        matrix[0] = Complex::one();
+                                        matrix[5] = single_central_mat[0];
+                                        matrix[6] = single_central_mat[1];
+                                        matrix[9] = single_central_mat[2];
+                                        matrix[10] = single_central_mat[3];
+                                        matrix[15] = Complex::from_polar(1.0, *double_occ_phase);
+                                    },
+                                )
+                        })
+                });
+            let py_indices = indices.into_pyarray(py).to_owned();
+            let py_mats = matrices.into_pyarray(py).to_owned();
+            (py_probs, Some((py_indices, py_mats)))
+        } else {
+            (py_probs, None)
         }
     }
 
@@ -990,6 +1104,37 @@ impl<const N: usize> MultiDefectStateRaw<N> {
                     let p = 2 * i + offset;
                     let mat = make_unitary(&mut rng);
                     let phase = 2f64 * std::f64::consts::PI * rng.gen::<f64>();
+                    mixed_state
+                        .axis_iter_mut(Axis(0))
+                        .into_par_iter()
+                        .for_each(|mut s| {
+                            Self::apply_matrix(&mut s, &self.details, p, &mat, phase);
+                        });
+                });
+            })
+    }
+
+    fn apply_brick_layer_and_get_matrices(
+        &mut self,
+        offset: bool,
+        periodic_boundaries: bool,
+        matrix_storage: &mut [Vec<((usize, usize), [Complex<f64>; 4], f64)>],
+    ) {
+        if periodic_boundaries {
+            unimplemented!()
+        }
+        let offset = if offset { 1 } else { 0 };
+        self.experiment_states
+            .axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .zip(matrix_storage.par_iter_mut())
+            .for_each(|(mut mixed_state, matrix_storage)| {
+                let mut rng = rand::thread_rng();
+                (0..(self.details.num_sites - offset) / 2).for_each(|i| {
+                    let p = 2 * i + offset;
+                    let mat = make_unitary(&mut rng);
+                    let phase = 2f64 * std::f64::consts::PI * rng.gen::<f64>();
+                    matrix_storage.push(((p, p + 1), mat, phase));
                     mixed_state
                         .axis_iter_mut(Axis(0))
                         .into_par_iter()

@@ -67,7 +67,7 @@ where
     sum
 }
 
-// From secion 2.3 of http://home.lu.lv/~sd20008/papers/essays/Random%20unitary%20[paper].pdf
+// From section 2.3 of http://home.lu.lv/~sd20008/papers/essays/Random%20unitary%20[paper].pdf
 /// Make a random 2x2 unitary matrix.
 pub fn make_unitary<R: Rng>(rng: &mut R) -> [Complex<f64>; 4] {
     let two_pi = std::f64::consts::PI * 2.0;
